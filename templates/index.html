@@ -1,0 +1,133 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Viewer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .stream-container {
+            position: relative;
+            width: 100%;
+            padding-top: 56.25%; /* 16:9 Aspect Ratio */
+            background: #000;
+            border-radius: 0.5rem;
+            overflow: hidden;
+        }
+        
+        .stream-iframe {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 60px;
+            height: 34px;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 34px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 26px;
+            width: 26px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider {
+            background-color: #2196F3;
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(26px);
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <div class="max-w-5xl mx-auto bg-white rounded-lg shadow-lg p-6">
+            <h1 class="text-3xl font-bold mb-6 text-gray-800">Stream Viewer</h1>
+            
+            <!-- Stream Controls -->
+            <div class="flex items-center space-x-4 mb-6">
+                <label class="toggle-switch">
+                    <input type="checkbox" id="streamToggle">
+                    <span class="slider"></span>
+                </label>
+                <span id="streamStatus" class="text-lg font-medium text-gray-700">
+                    Original Stream
+                </span>
+            </div>
+
+            <!-- Stream Container -->
+            <div class="stream-container mb-6">
+                <iframe
+                    id="streamFrame"
+                    class="stream-iframe"
+                    src="{{ stream_urls.original }}"
+                    allowfullscreen>
+                </iframe>
+            </div>
+
+            <!-- Stream Info -->
+            <div class="bg-gray-50 p-4 rounded-lg">
+                <h2 class="text-lg font-semibold text-gray-800 mb-2">Stream Information</h2>
+                <p id="streamInfo" class="text-gray-600">
+                    Currently showing the original stream without translation.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const streamToggle = document.getElementById('streamToggle');
+        const streamFrame = document.getElementById('streamFrame');
+        const streamStatus = document.getElementById('streamStatus');
+        const streamInfo = document.getElementById('streamInfo');
+        const streamUrls = {
+            original: "{{ stream_urls.original }}",
+            translated: "{{ stream_urls.translated }}"
+        };
+
+        streamToggle.addEventListener('change', function() {
+            if (this.checked) {
+                streamFrame.src = streamUrls.translated;
+                streamStatus.textContent = "Translated Stream";
+                streamInfo.textContent = "Currently showing the translated stream with subtitles.";
+            } else {
+                streamFrame.src = streamUrls.original;
+                streamStatus.textContent = "Original Stream";
+                streamInfo.textContent = "Currently showing the original stream without translation.";
+            }
+        });
+    </script>
+</body>
+</html>
