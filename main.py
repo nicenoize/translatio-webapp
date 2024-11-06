@@ -8,6 +8,10 @@ import uvicorn
 import os
 import asyncio
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request, WebSocket
+from websockets.exceptions import WebSocketException
+import signal
+
 
 load_dotenv()
 
@@ -33,18 +37,6 @@ async def root(request: Request):
         "index.html",
         {"request": request, "stream_urls": STREAM_URLS}
     )
-
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-import uvicorn
-import os
-import asyncio
-from dotenv import load_dotenv
-import signal
-
-load_dotenv()
 
 from stream_processor.stream_audio_processor import StreamAudioProcessor
 
@@ -106,11 +98,28 @@ async def startup_event():
 async def shutdown():
     await shutdown_event()
 
+@app.websocket("/ws/translations")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    # Register the WebSocket client
+    client_id = await processor.openai_client.register_websocket(websocket)
+    
+    try:
+        while True:
+            # Keep the connection alive
+            await websocket.receive_text()
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        # Unregister the WebSocket client when the connection is closed
+        await processor.openai_client.unregister_websocket(client_id)
+
 if __name__ == "__main__":
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=8000,
-        log_level="debug",
+        log_level="info",
         reload=False  # Disable reload to prevent multiple processor instances
     )

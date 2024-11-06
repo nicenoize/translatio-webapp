@@ -71,63 +71,53 @@
         }
     </style>
 </head>
-<body class="bg-gray-100 min-h-screen">
+<body class="bg-gray-100">
     <div class="container mx-auto px-4 py-8">
         <div class="max-w-5xl mx-auto bg-white rounded-lg shadow-lg p-6">
             <h1 class="text-3xl font-bold mb-6 text-gray-800">Stream Viewer</h1>
-            
-            <!-- Stream Controls -->
-            <div class="flex items-center space-x-4 mb-6">
-                <label class="toggle-switch">
-                    <input type="checkbox" id="streamToggle">
-                    <span class="slider"></span>
-                </label>
-                <span id="streamStatus" class="text-lg font-medium text-gray-700">
-                    Original Stream
-                </span>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                <!-- Original Stream -->
+                <div class="stream-container bg-black rounded-lg overflow-hidden">
+                    <iframe 
+                        src="{{ stream_urls.original }}"
+                        class="stream-iframe"
+                        frameborder="0"
+                        allowfullscreen>
+                    </iframe>
+                </div>
+
+                <!-- Translated Stream -->
+                <div class="stream-container bg-black rounded-lg overflow-hidden">
+                    <iframe 
+                        src="{{ stream_urls.translated }}"
+                        class="stream-iframe"
+                        frameborder="0"
+                        allowfullscreen>
+                    </iframe>
+                </div>
             </div>
 
-            <!-- Stream Container -->
-            <div class="stream-container mb-6">
-                <iframe
-                    id="streamFrame"
-                    class="stream-iframe"
-                    src="{{ stream_urls.original }}"
-                    allowfullscreen>
-                </iframe>
+            <!-- Translation Display -->
+            <div class="mb-6">
+                <h2 class="text-xl font-semibold mb-2 text-gray-800">Live Translation</h2>
+                <div id="translationDisplay" class="bg-gray-50 p-4 rounded-lg h-40 overflow-y-auto font-mono text-sm">
+                    Waiting for translation...
+                </div>
             </div>
 
-            <!-- Stream Info -->
-            <div class="bg-gray-50 p-4 rounded-lg">
-                <h2 class="text-lg font-semibold text-gray-800 mb-2">Stream Information</h2>
-                <p id="streamInfo" class="text-gray-600">
-                    Currently showing the original stream without translation.
-                </p>
+            <!-- Audio Player -->
+            <div class="mb-6">
+                <h2 class="text-xl font-semibold mb-2 text-gray-800">Translated Audio</h2>
+                <audio id="translatedAudio" controls>
+                    <source id="audioSource" type="audio/wav">
+                    Your browser does not support the audio element.
+                </audio>
             </div>
         </div>
     </div>
 
-    <script>
-        const streamToggle = document.getElementById('streamToggle');
-        const streamFrame = document.getElementById('streamFrame');
-        const streamStatus = document.getElementById('streamStatus');
-        const streamInfo = document.getElementById('streamInfo');
-        const streamUrls = {
-            original: "{{ stream_urls.original }}",
-            translated: "{{ stream_urls.translated }}"
-        };
-
-        streamToggle.addEventListener('change', function() {
-            if (this.checked) {
-                streamFrame.src = streamUrls.translated;
-                streamStatus.textContent = "Translated Stream";
-                streamInfo.textContent = "Currently showing the translated stream with subtitles.";
-            } else {
-                streamFrame.src = streamUrls.original;
-                streamStatus.textContent = "Original Stream";
-                streamInfo.textContent = "Currently showing the original stream without translation.";
-            }
-        });
-    </script>
+    <!-- Include the external JavaScript file -->
+    <script src="/static/script.js"></script>
 </body>
 </html>

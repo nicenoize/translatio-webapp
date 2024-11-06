@@ -47,7 +47,7 @@ class AudioManager:
                     data = os.read(self.audio_pipe_fd, read_chunk_size)
                     if data:
                         self.buffer.extend(data)
-                        self.logger.debug(f"Buffer size: {len(self.buffer)} bytes")
+                        # self.logger.debug(f"Buffer size: {len(self.buffer)} bytes")
 
                         # Process complete chunks when we have enough data
                         while len(self.buffer) >= self.min_buffer_size:

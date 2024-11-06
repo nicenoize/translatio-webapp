@@ -110,10 +110,7 @@ class StreamAudioProcessor:
             self.tasks = [
                 asyncio.create_task(self.ffmpeg_manager.monitor_process()),
                 asyncio.create_task(self.audio_manager.process_audio(self.openai_client)),
-                asyncio.create_task(self.openai_client.handle_responses(
-                    self.audio_manager,
-                    self.subtitle_manager
-                ))
+                asyncio.create_task(self.openai_client.handle_responses())
             ]
 
             # Wait for tasks to complete or running to become False
