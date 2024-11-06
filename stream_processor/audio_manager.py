@@ -13,83 +13,78 @@ class AudioManager:
         self.logger = logging.getLogger(__name__)
         self.input_audio_pipe = input_audio_pipe
         self.ffmpeg_process = None
-        self.buffer = b''
         
-        # Ensure the pipe exists before opening
-        if not os.path.exists(self.input_audio_pipe):
-            raise FileNotFoundError(f"Named pipe not found: {self.input_audio_pipe}")
-            
+        # Create debug directories
+        os.makedirs('output/debug/audio/raw', exist_ok=True)
+        
+        # Open pipe in non-blocking mode
         try:
-            # Open in read-write mode to prevent blocking
-            self.audio_pipe_fd = os.open(self.input_audio_pipe, os.O_RDWR | os.O_NONBLOCK)
-            self.logger.info(f"Successfully opened input audio pipe: {self.input_audio_pipe}")
+            self.audio_pipe_fd = os.open(input_audio_pipe, os.O_RDWR | os.O_NONBLOCK)
+            self.logger.info(f"Opened input audio pipe: {input_audio_pipe}")
         except Exception as e:
             self.logger.error(f"Failed to open input audio pipe: {e}")
             raise
             
-        self.ffmpeg_process = None
-        self.buffer = b''  # Add buffer for accumulating audio data
+        self.chunk_counter = 0
+        self.debug_file = open('output/debug/audio/audio_chunks.log', 'w')
+        self.debug_file.write("timestamp,chunk_id,size,total_size\n")
+        self.total_bytes = 0
 
-    def setup_audio_pipe(self):
-        with suppress(FileNotFoundError):
-            os.unlink(self.audio_pipe_path)
-            
-        try:
-            os.mkfifo(self.audio_pipe_path)
-            self.logger.info(f"Created named pipe at {self.audio_pipe_path}")
-            
-            # Open in read-write mode to prevent blocking
-            self.audio_pipe_fd = os.open(self.audio_pipe_path, os.O_RDWR | os.O_NONBLOCK)
-            self.logger.info("Successfully opened named pipe")
-        except OSError as e:
-            self.logger.error(f"Failed to setup audio pipe: {e}")
-            raise
+        # Calculate minimum buffer size for 100ms of audio
+        # At 24kHz, 16-bit (2 bytes) mono audio:
+        # 24000 samples/sec * 2 bytes/sample * 0.1 sec = 4800 bytes
+        self.min_buffer_size = 240000  # 5s of audio at 24kHz
+        self.buffer = bytearray()
 
     async def process_audio(self, openai_client):
-        """Process audio from the input pipe"""
-        if not self.ffmpeg_process:
-            self.logger.error("FFmpeg process not set in AudioManager")
-            return
-
+        """Process audio from FFmpeg pipe"""
         try:
-            chunk_size = 3200  # 100ms of audio at 16kHz, 16-bit mono
-            self.logger.info("Starting audio processing loop")
+            read_chunk_size = 1024  # Size to read from pipe at once
             
             while True:
                 try:
-                    # Read from the named pipe
-                    data = os.read(self.audio_pipe_fd, chunk_size)
+                    # Read data from pipe
+                    data = os.read(self.audio_pipe_fd, read_chunk_size)
                     if data:
-                        self.buffer += data
-                        self.logger.debug(f"Read {len(data)} bytes from input pipe, buffer size: {len(self.buffer)}")
-                        
-                        # Send when we have at least 100ms of audio
-                        if len(self.buffer) >= chunk_size:
-                            self.logger.info(f"Sending audio chunk of size {len(self.buffer)} to OpenAI")
-                            base64_audio = base64.b64encode(self.buffer).decode('utf-8')
-                            await OpenAIClient.send_audio_chunk(base64_audio)
-                            await OpenAIClient.commit_audio()
-                            self.buffer = b''
-                    
+                        self.buffer.extend(data)
+                        self.logger.debug(f"Buffer size: {len(self.buffer)} bytes")
+
+                        # Process complete chunks when we have enough data
+                        while len(self.buffer) >= self.min_buffer_size:
+                            # Take a chunk of exactly min_buffer_size
+                            chunk = self.buffer[:self.min_buffer_size]
+                            self.buffer = self.buffer[self.min_buffer_size:]
+
+                            # Encode to base64 and send to OpenAI API
+                            base64_audio = base64.b64encode(chunk).decode('utf-8')
+                            await openai_client.send_audio_chunk(base64_audio)
+
+                            self.logger.info(f"Sent audio chunk of size: {len(chunk)} bytes")
+                            
+                            # Increment counter and log
+                            self.chunk_counter += 1
+                            self.total_bytes += len(chunk)
+                            self.debug_file.write(f"{self.chunk_counter},{len(chunk)},{self.total_bytes}\n")
+                            self.debug_file.flush()
+
+                    await asyncio.sleep(0.01)  # Prevent tight loop
                 except BlockingIOError:
-                    # No data available to read
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.01)  # No data yet, retry
                 except Exception as e:
-                    self.logger.error(f"Error reading audio data: {e}")
+                    self.logger.error(f"Error processing audio: {e}", exc_info=True)
                     break
-
-                await asyncio.sleep(0.01)  # Prevent busy-waiting
-
+                    
+                await asyncio.sleep(0.01)
+                
         except Exception as e:
-            self.logger.error(f"Error in process_audio: {e}")
+            self.logger.error(f"Error in process_audio: {e}", exc_info=True)
         finally:
-            # Send any remaining audio
-            if self.buffer:
-                self.logger.info(f"Sending final audio chunk of size {len(self.buffer)}")
-                base64_audio = base64.b64encode(self.buffer).decode('utf-8')
-                await OpenAIClient.send_audio_chunk(base64_audio)
-                await OpenAIClient.commit_audio()
-
+            self.debug_file.close()
+            if len(self.buffer) >= self.min_buffer_size:
+                self.logger.info(f"Processing final buffer of {len(self.buffer)} bytes")
+                base64_audio = base64.b64encode(bytes(self.buffer)).decode('utf-8')
+                await openai_client.send_audio_chunk(base64_audio)
+                await openai_client.send_audio_commit()
 
     def set_ffmpeg_process(self, process):
         """Set the FFmpeg process reference"""
@@ -112,13 +107,14 @@ class AudioManager:
 
     def cleanup(self):
         """Clean up resources"""
-        if self.audio_pipe_fd is not None:
+        if hasattr(self, 'audio_pipe_fd') and self.audio_pipe_fd is not None:
             try:
                 os.close(self.audio_pipe_fd)
-                self.audio_pipe_fd = None
             except OSError as e:
                 self.logger.error(f"Error closing pipe: {e}")
-
-        with suppress(FileNotFoundError):
-            os.unlink(self.audio_pipe_path)
-            self.logger.info("Cleaned up named pipe")
+                
+        if hasattr(self, 'debug_file'):
+            try:
+                self.debug_file.close()
+            except Exception as e:
+                self.logger.error(f"Error closing debug file: {e}")

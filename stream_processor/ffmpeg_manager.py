@@ -26,64 +26,79 @@ class FFmpegManager:
                 pass
 
     def start_ffmpeg_process(self):
-        """Start the FFmpeg process with input stream"""
-        command = [
-            'ffmpeg',
-            '-loglevel', 'debug',
-            '-i', self.input_stream_url,  # Input 0: video + original audio
-
-            # Output the input audio to a named pipe for the AudioManager
-            '-map', '0:a',
-            '-f', 's16le',
-            '-ac', '1',
-            '-ar', '16000',
-            self.input_audio_pipe,  # Write audio to input_audio_pipe
-
-            # Read the translated audio from a named pipe
-            '-f', 's16le',
-            '-ar', '16000',
-            '-ac', '1',
-            '-i', self.translated_audio_pipe,   # Input 1: translated audio
-
-            # Map video from Input 0
-            '-map', '0:v',
-
-            # Map translated audio from Input 1
-            '-map', '1:a',
-
-            # Apply subtitles via ZMQ
-            '-vf', f"drawtext=text='':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=h-50:box=1:boxcolor=black@0.5:reload=1:zeromq=bind_address=tcp\\://{self.zmq_address}",
-
-            # Output settings
-            '-c:v', 'copy',
-            '-c:a', 'aac',
-            '-f', 'flv',
-            self.output_rtmp_url
+        ffmpeg_command = [
+            "ffmpeg", "-loglevel", "debug",  # Set to debug for detailed FFmpeg output
+            "-i", self.input_stream_url,
+            "-map", "0:a", "-vn", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000",
+            "-f", "s16le", self.input_audio_pipe,
+            "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-f", "flv", self.output_rtmp_url
         ]
-
-        self.logger.info(f"Starting FFmpeg with command: {' '.join(command)}")
+        self.logger.info(f"Starting FFmpeg with command: {' '.join(ffmpeg_command)}")
 
         try:
             self.ffmpeg_process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
+                ffmpeg_command,
                 stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-                bufsize=10**8
+                stdout=subprocess.PIPE  # Capture FFmpeg's debug output
             )
-
-            # Wait a moment and check if process is still running
-            time.sleep(2)
-            if self.ffmpeg_process.poll() is not None:
-                stderr = self.ffmpeg_process.stderr.read().decode()
-                self.logger.error(f"FFmpeg failed to start. Error: {stderr}")
-                raise RuntimeError("FFmpeg failed to start")
-
             self.logger.info("FFmpeg process started successfully")
-
         except Exception as e:
             self.logger.error(f"Failed to start FFmpeg: {e}")
-            raise
+
+
+    # def start_ffmpeg_process(self):
+    #     """Start the FFmpeg process with input stream"""
+    #     command = [
+    #         'ffmpeg',
+    #         '-loglevel', 'warning',  # Reduce noise
+    #         '-i', self.input_stream_url,
+            
+    #         # Extract audio in OpenAI's expected format
+    #         '-map', '0:a',
+    #         '-f', 's16le',
+    #         '-ac', '1',
+    #         '-ar', '24000',  # Match OpenAI's sample rate
+    #         '-acodec', 'pcm_s16le',
+    #         self.input_audio_pipe,
+
+    #         # Read translated audio
+    #         '-f', 's16le',
+    #         '-ar', '24000',
+    #         '-ac', '1',
+    #         '-i', self.translated_audio_pipe,
+            
+    #         '-map', '0:v',
+    #         '-map', '1:a',
+    #         '-vf', f"drawtext=text='':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=h-50:box=1:boxcolor=black@0.5:reload=1:zeromq=bind_address=tcp\\://{self.zmq_address}",
+    #         '-c:v', 'copy',
+    #         '-c:a', 'aac',
+    #         '-f', 'flv',
+    #         self.output_rtmp_url
+    #     ]
+
+    #     self.logger.info(f"Starting FFmpeg with command: {' '.join(command)}")
+
+    #     try:
+    #         self.ffmpeg_process = subprocess.Popen(
+    #             command,
+    #             stdout=subprocess.PIPE,
+    #             stderr=subprocess.PIPE,
+    #             stdin=subprocess.PIPE,
+    #             bufsize=10**8
+    #         )
+
+    #         # Wait a moment and check if process is still running
+    #         time.sleep(2)
+    #         if self.ffmpeg_process.poll() is not None:
+    #             stderr = self.ffmpeg_process.stderr.read().decode()
+    #             self.logger.error(f"FFmpeg failed to start. Error: {stderr}")
+    #             raise RuntimeError("FFmpeg failed to start")
+
+    #         self.logger.info("FFmpeg process started successfully")
+
+    #     except Exception as e:
+    #         self.logger.error(f"Failed to start FFmpeg: {e}")
+    #         raise
 
     async def monitor_process(self):
         """Monitor FFmpeg process and log its output"""

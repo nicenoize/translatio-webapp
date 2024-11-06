@@ -8,6 +8,7 @@ from .audio_manager import AudioManager
 from .subtitle_manager import SubtitleManager
 from .ffmpeg_manager import FFmpegManager
 import os
+import time
 
 class StreamAudioProcessor:
     def __init__(self, openai_api_key: str, stream_url: str, output_rtmp_url: str):
@@ -33,6 +34,25 @@ class StreamAudioProcessor:
         self.tasks = []
         self.running = True
         self.cleanup_lock = asyncio.Lock()
+
+    def start_processing(self):
+        # Open the input named pipe in binary mode
+        with open(self.input_pipe_path, 'rb') as pipe:
+            print("Starting to stream audio data from input_audio_pipe to OpenAI real-time API...")
+            
+            while True:
+                # Read a chunk of data from the pipe
+                data = pipe.read(8192)  # Adjust chunk size as necessary
+                
+                if not data:
+                    time.sleep(0.01)  # Sleep briefly if no data is available
+                    continue
+                
+                # Send the chunk of data to the OpenAI client for processing
+                self.openai_client.send_audio_chunk(data)
+
+                # Optional: add a small sleep interval to control data flow
+                time.sleep(0.05)
 
     def create_named_pipes(self):
         """Create named pipes if they don't exist"""

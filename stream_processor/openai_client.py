@@ -30,6 +30,15 @@ class OpenAIClient:
         self.audio_buffer = []
         self.min_buffer_size = 48000  # 2 seconds of audio at 24kHz
 
+        self.debug_dir = 'output/debug/openai'
+        os.makedirs(self.debug_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.debug_dir, 'sent'), exist_ok=True)
+        os.makedirs(os.path.join(self.debug_dir, 'received'), exist_ok=True)
+        
+        self.debug_log = open(os.path.join(self.debug_dir, 'openai_debug.log'), 'w')
+        self.debug_log.write("timestamp,event_type,size_bytes,details\n")
+        self.chunk_counter = 0
+
     async def connect(self):
         """Connect to OpenAI's Realtime API"""
         url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
@@ -102,22 +111,56 @@ class OpenAIClient:
         await self.ws.send(json.dumps(response_create))
 
     async def send_audio_chunk(self, base64_audio: str):
-        """Send audio for translation"""
-        if self.ws:
-            # Create a proper audio message
-            audio_message = {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_audio",
-                        "audio": base64_audio
-                    }]
+        if not self.ws:
+            self.logger.error("WebSocket not initialized")
+            return
+
+        try:
+            # Create an event to append the audio buffer
+            append_event = {
+                "type": "input_audio_buffer.append",
+                "audio": base64_audio
+            }
+            await self.ws.send(json.dumps(append_event))
+            self.logger.debug("Sent audio buffer append event")
+
+            # Commit the audio chunk for processing
+            commit_event = {
+                "type": "input_audio_buffer.commit"
+            }
+            await self.ws.send(json.dumps(commit_event))
+            self.logger.info("Committed audio chunk")
+        except Exception as e:
+            self.logger.error(f"Error sending audio chunk: {e}", exc_info=True)
+
+
+    async def send_audio_commit(self):
+        """Commit audio buffer and create response"""
+        if not self.ws:
+            return
+            
+        try:
+            # Commit the buffer
+            commit_event = {
+                "type": "input_audio_buffer.commit"
+            }
+            await self.ws.send(json.dumps(commit_event))
+            
+            # Create a response
+            response_event = {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["text", "audio"],
+                    "instructions": "Translate to German"
                 }
             }
-            await self.ws.send(json.dumps(audio_message))
-            self.logger.debug("Sent audio chunk for translation")
+            await self.ws.send(json.dumps(response_event))
+            
+            self.logger.info("Committed audio buffer and requested translation")
+            
+        except Exception as e:
+            self.logger.error(f"Error committing audio: {e}", exc_info=True)
+
 
     async def commit_audio(self):
         """Commit audio and request translation"""
@@ -158,6 +201,11 @@ class OpenAIClient:
                             current_audio_segment.extend(decoded_audio)
                         except Exception as e:
                             self.logger.error(f"Error decoding audio: {e}")
+
+                elif event_type == "response.text.delta":
+                    text = event["delta"]
+                    if text.strip():
+                        subtitle_manager.update_subtitle(text)
 
                 elif event_type == "response.audio.done":
                     # Write accumulated audio segment
