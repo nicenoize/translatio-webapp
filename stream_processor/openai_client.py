@@ -10,6 +10,7 @@ from typing import Optional, Dict
 import wave
 import struct
 from fastapi import WebSocket
+import time
 
 class OpenAIClient:
     def __init__(self, api_key: str, translated_audio_pipe: str):
@@ -29,22 +30,19 @@ class OpenAIClient:
             self.logger.error(f"Failed to open translated audio pipe: {e}")
             raise
 
-        # Create output directories
+        # Create separate directories for input and output audio
         os.makedirs('output/transcripts', exist_ok=True)
-        os.makedirs('output/audio', exist_ok=True)
+        os.makedirs('output/audio/input', exist_ok=True)
+        os.makedirs('output/audio/output', exist_ok=True)
         
         self.transcript_file = open('output/transcripts/transcript.txt', 'w', encoding='utf-8')
         self.audio_counter = 0
+        self.current_input_id = None  # Track current input audio ID
+        self.translation_pairs = {}  # Track input-output audio pairs
 
-        # Initialize buffers for outgoing audio
         self.outgoing_audio_buffer = bytearray()
         self.audio_buffer_lock = asyncio.Lock()
-        
-        # Increase buffer size to 5 seconds of audio at 24kHz, 16-bit mono
-        # 24000 samples/sec * 2 bytes/sample * 5 sec = 240000 bytes
         self.min_buffer_size = 240000  # 5 seconds buffer
-        
-        # Add translation accumulation buffer
         self.current_translation = ""
         self.translation_buffer = []
 
@@ -58,34 +56,48 @@ class OpenAIClient:
         self.ws = await websockets.connect(url, extra_headers=headers)
         self.logger.info("Connected to OpenAI Realtime API")
 
-        # Update session configuration for better translation quality
         session_update = {
             "type": "session.update",
             "session": {
-                "instructions": """You are a real-time translator. Translate all incoming English speech into natural German. 
-                Maintain the speaking style and tone of the original speaker. Wait for complete thoughts or sentences before translating.
-                Do not engage in conversation or add any commentary. Only translate the content.""",
-                "model": "gpt-4o-realtime-preview-2024-10-01",
-                "voice": "alloy",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
+                "tools": [{
+                    "type": "function",
+                    "name": "translate",
+                    "description": "Translate speech from English to German, maintaining natural tone and style",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "The text to translate"
+                            },
+                            "target_language": {
+                                "type": "string",
+                                "enum": ["de"],
+                                "default": "de"
+                            }
+                        },
+                        "required": ["text"]
+                    }
+                }],
                 "input_audio_transcription": {
-                    "model": "whisper-1",
+                    "model": "whisper-1"
                 },
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.6,  # Increased threshold for better sentence detection
-                    "prefix_padding_ms": 500,  # Increased padding
-                    "silence_duration_ms": 400  # Increased silence duration
+                    "threshold": 0.6,
+                    "prefix_padding_ms": 500,
+                    "silence_duration_ms": 400
                 },
+                "voice": "alloy",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
                 "temperature": 0.7,
-                "modalities": ["text", "audio"],
-                "max_response_output_tokens": "inf"
+                "modalities": ["text", "audio"]
             }
         }
         await self.ws.send(json.dumps(session_update))
-
         await self.init_conversation()
+
     
     async def init_conversation(self):
         """Initialize conversation context"""
@@ -96,7 +108,7 @@ class OpenAIClient:
                 "role": "system",
                 "content": [{
                     "type": "input_text",
-                    "text": "Translate incoming English speech to German. Maintain speaker style and wait for complete thoughts."
+                    "text": "You are a real-time English to German translator. Translate naturally and maintain the original tone."
                 }]
             }
         }
@@ -112,29 +124,61 @@ class OpenAIClient:
             decoded_audio = base64.b64decode(base64_audio)
             async with self.audio_buffer_lock:
                 self.outgoing_audio_buffer.extend(decoded_audio)
-                self.logger.debug(f"Appended {len(decoded_audio)} bytes to outgoing buffer. Total buffer size: {len(self.outgoing_audio_buffer)} bytes")
-
+                
                 if len(self.outgoing_audio_buffer) >= self.min_buffer_size:
-                    # Wrap PCM data in WAV format
-                    wav_bytes = self.wrap_pcm_in_wav(self.outgoing_audio_buffer)
-                    # Send audio buffer append event
+                    # Generate unique ID for this input audio
+                    self.current_input_id = f"input_{int(time.time())}_{self.audio_counter}"
+                    
+                    # Save input audio first
+                    input_filename = self.save_audio_segment(
+                        self.outgoing_audio_buffer, 
+                        is_input=True, 
+                        audio_id=self.current_input_id
+                    )
+                    
+                    # Send audio buffer
                     append_event = {
                         "type": "input_audio_buffer.append",
                         "audio": base64.b64encode(self.outgoing_audio_buffer).decode('utf-8')
                     }
                     await self.ws.send(json.dumps(append_event))
-                    self.logger.debug("Sent audio buffer append event")
-
-                    # Commit the audio chunk for processing
+                    
+                    # Commit the buffer
                     commit_event = {
                         "type": "input_audio_buffer.commit"
                     }
                     await self.ws.send(json.dumps(commit_event))
-                    self.logger.info("Committed audio chunk")
 
-                    # Save and clear the buffer
-                    self.save_audio_segment(self.outgoing_audio_buffer)
+                    # Request translation
+                    response_event = {
+                        "type": "response.create",
+                        "response": {
+                            "tools": [{
+                                "type": "function",
+                                "name": "translate",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "text": {
+                                            "type": "string",
+                                            "description": "The text to translate"
+                                        },
+                                        "target_language": {
+                                            "type": "string",
+                                            "enum": ["de"],
+                                            "default": "de"
+                                        }
+                                    },
+                                    "required": ["text"]
+                                }
+                            }],
+                            "modalities": ["text", "audio"]
+                        }
+                    }
+                    await self.ws.send(json.dumps(response_event))
+                    
                     self.outgoing_audio_buffer = bytearray()
+                    
         except Exception as e:
             self.logger.error(f"Error sending audio chunk: {e}", exc_info=True)
 
@@ -150,12 +194,30 @@ class OpenAIClient:
             }
             await self.ws.send(json.dumps(commit_event))
             
-            # Create a response
+            # Create a response with proper tool configuration
             response_event = {
                 "type": "response.create",
                 "response": {
-                    "modalities": ["text", "audio"],
-                    "instructions": "Translate to German"
+                    "tools": [{
+                        "type": "function",
+                        "name": "translate",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "text": {
+                                    "type": "string",
+                                    "description": "The text to translate"
+                                },
+                                "target_language": {
+                                    "type": "string",
+                                    "enum": ["de"],
+                                    "default": "de"
+                                }
+                            },
+                            "required": ["text"]
+                        }
+                    }],
+                    "modalities": ["text", "audio"]
                 }
             }
             await self.ws.send(json.dumps(response_event))
@@ -231,18 +293,27 @@ class OpenAIClient:
             await self.unregister_websocket(client_id)
 
 
-    def save_audio_segment(self, audio_data: bytes, sample_rate: int = 24000):
-        """Save audio segment as WAV file"""
-        filename = f'output/audio/segment_{self.audio_counter}.wav'
+    # Differentiate between outgoing or incoming audio
+    def save_audio_segment(self, audio_data: bytes, is_input: bool = True, audio_id: str = None) -> str:
+        """Save audio segment as WAV file with organized naming"""
+        if audio_id is None:
+            audio_id = f"{'input' if is_input else 'output'}_{int(time.time())}_{self.audio_counter}"
+        
+        # Determine directory and filename
+        subdir = 'input' if is_input else 'output'
+        filename = f'output/audio/{subdir}/{audio_id}.wav'
         
         with wave.open(filename, 'wb') as wav_file:
             wav_file.setnchannels(1)  # Mono
             wav_file.setsampwidth(2)  # 16-bit
-            wav_file.setframerate(sample_rate)
+            wav_file.setframerate(24000)  # 24kHz
             wav_file.writeframes(audio_data)
         
+        if is_input:
+            self.translation_pairs[audio_id] = None  # Initialize pair tracking
+        
+        self.logger.debug(f"Saved {'input' if is_input else 'output'} audio: {filename}")
         self.audio_counter += 1
-        self.logger.debug(f"Saved audio segment: {filename}")
         return filename
 
     async def handle_responses(self):
@@ -250,6 +321,7 @@ class OpenAIClient:
         try:
             wav_buffer = bytearray()
             accumulated_text = ""
+            current_output_id = None
 
             while True:
                 response = await self.ws.recv()
@@ -259,52 +331,55 @@ class OpenAIClient:
                 self.logger.debug(f"Received event: {pprint.pformat(event)}")
 
                 if event_type == "response.audio.delta":
-                    # Handle audio data with larger chunks
                     audio_data = event.get("delta", "")
                     if audio_data:
                         try:
                             decoded_audio = base64.b64decode(audio_data)
                             wav_buffer.extend(decoded_audio)
-                            self.logger.debug(f"Appended {len(decoded_audio)} bytes to received audio buffer. Total size: {len(wav_buffer)} bytes")
 
-                            # Increased buffer size for better audio quality (10 seconds of audio)
-                            if len(wav_buffer) >= 480000:  # 24kHz * 2 bytes * 10 seconds
+                            if len(wav_buffer) >= 480000:  # 10 seconds buffer
+                                if not current_output_id:
+                                    current_output_id = f"output_{int(time.time())}_{self.audio_counter}"
+                                    if self.current_input_id:
+                                        self.translation_pairs[self.current_input_id] = current_output_id
+                                
                                 wav_bytes = self.wrap_pcm_in_wav(wav_buffer)
                                 await self.broadcast_audio(wav_bytes)
-                                self.save_audio_segment(wav_buffer)
-                                self.logger.debug("Broadcasted and saved 10-second audio segment")
+                                self.save_audio_segment(wav_buffer, is_input=False, audio_id=current_output_id)
                                 wav_buffer = bytearray()
                                 
                         except Exception as e:
                             self.logger.error(f"Error handling audio data: {e}")
 
                 elif event_type == "response.audio_transcript.delta":
-                    # Accumulate translation text
                     text = event.get("delta", "")
                     if text.strip():
                         accumulated_text += text
-                        self.transcript_file.write(text)
+                        self.transcript_file.write(f"[{self.current_input_id}] {text}\n")
                         self.transcript_file.flush()
                         
-                        # Only broadcast complete sentences
                         if any(char in text for char in ['.', '!', '?', '\n']):
                             await self.broadcast_translation(accumulated_text)
-                            self.logger.debug(f"Broadcasted accumulated translation: {accumulated_text}")
                             accumulated_text = ""
 
                 elif event_type == "response.audio.done":
-                    # Handle remaining audio and text
                     if wav_buffer:
+                        if not current_output_id:
+                            current_output_id = f"output_{int(time.time())}_{self.audio_counter}"
+                            if self.current_input_id:
+                                self.translation_pairs[self.current_input_id] = current_output_id
+                        
                         wav_bytes = self.wrap_pcm_in_wav(wav_buffer)
                         await self.broadcast_audio(wav_bytes)
-                        self.save_audio_segment(wav_buffer)
-                        self.logger.debug("Broadcasted and saved remaining audio buffer")
+                        self.save_audio_segment(wav_buffer, is_input=False, audio_id=current_output_id)
                         wav_buffer = bytearray()
                     
                     if accumulated_text:
                         await self.broadcast_translation(accumulated_text)
-                        self.logger.debug(f"Broadcasted remaining translation: {accumulated_text}")
                         accumulated_text = ""
+                    
+                    # Reset IDs for next translation
+                    current_output_id = None
 
                 elif event_type == "error":
                     error_info = event.get("error", {})

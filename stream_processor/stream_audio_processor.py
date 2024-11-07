@@ -9,6 +9,7 @@ from .subtitle_manager import SubtitleManager
 from .ffmpeg_manager import FFmpegManager
 import os
 import time
+from contextlib import suppress
 
 class StreamAudioProcessor:
     def __init__(self, openai_api_key: str, stream_url: str, output_rtmp_url: str):
@@ -42,7 +43,7 @@ class StreamAudioProcessor:
             
             while True:
                 # Read a chunk of data from the pipe
-                data = pipe.read(8192)  # Adjust chunk size as necessary
+                data = pipe.read(480000)  # Adjust chunk size as necessary
                 
                 if not data:
                     time.sleep(0.01)  # Sleep briefly if no data is available

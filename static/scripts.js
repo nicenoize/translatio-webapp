@@ -1,28 +1,40 @@
 // static/script.js
 
 document.addEventListener('DOMContentLoaded', () => {
-    const translationDisplay = document.getElementById('translationDisplay');
+    const subtitles = document.getElementById('subtitles');
     const audioPlayer = document.getElementById('translatedAudio');
 
     // Determine the WebSocket protocol based on the page's protocol
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const socketUrl = `${protocol}://${window.location.host}/ws/translations`;
-    const socket = new WebSocket(socketUrl);
+    let socketUrl = `${protocol}://${window.location.host}/ws/translations`;
+    let socket = new WebSocket(socketUrl);
 
     // Audio Queue to handle sequential playback
     const audioQueue = [];
     let isPlaying = false;
 
+    // Fixed delay in milliseconds to synchronize audio with video
+    const fixedDelay = 2000; // 2 seconds
+
+    // Timestamp when the audio should start playing
+    let scheduledStartTime = null;
+
+    // Keep track of created blob URLs for cleanup
+    const blobUrls = new Set();
+
     socket.onopen = () => {
         console.log('WebSocket connection established');
+        clearSubtitles();
+        displaySubtitles('Connected to server. Waiting for translation...');
     };
 
     socket.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
+            console.log('Received message:', data.type);
 
             if (data.type === 'translation') {
-                displayTranslation(data.text);
+                displaySubtitles(data.text);
             } else if (data.type === 'audio') {
                 enqueueAudio(data.audio);
             }
@@ -33,33 +45,57 @@ document.addEventListener('DOMContentLoaded', () => {
 
     socket.onclose = (event) => {
         console.log('WebSocket connection closed:', event);
-        displayConnectionStatus('Connection closed. Attempting to reconnect...');
+        displaySubtitles('Connection closed. Attempting to reconnect...');
         attemptReconnect();
     };
 
     socket.onerror = (error) => {
         console.error('WebSocket error:', error);
-        displayConnectionStatus('WebSocket error. Check console for details.');
+        displaySubtitles('WebSocket error. Check console for details.');
     };
 
-    function displayTranslation(text) {
-        // If it's the first translation, clear the placeholder text
-        if (translationDisplay.textContent.trim() === 'Waiting for translation...') {
-            translationDisplay.textContent = '';
+    function clearSubtitles() {
+        subtitles.innerHTML = '';
+    }
+
+    function displaySubtitles(text) {
+        // Remove "waiting" message if present
+        if (subtitles.querySelector('.waiting-message')) {
+            clearSubtitles();
         }
 
-        const newTranslation = document.createElement('div');
-        newTranslation.textContent = text;
-        newTranslation.className = 'mb-2 p-2 bg-white rounded';
-        translationDisplay.appendChild(newTranslation);
+        const newSubtitle = document.createElement('div');
+        newSubtitle.textContent = text;
+        newSubtitle.className = 'mb-2 p-2 bg-gray-800 bg-opacity-75 rounded text-white inline-block';
+        
+        // Add timestamp
+        const timestamp = new Date().toLocaleTimeString();
+        const timeSpan = document.createElement('span');
+        timeSpan.textContent = `[${timestamp}] `;
+        timeSpan.className = 'text-gray-400 text-sm';
+        newSubtitle.insertBefore(timeSpan, newSubtitle.firstChild);
 
-        // Auto-scroll to the latest translation
-        translationDisplay.scrollTop = translationDisplay.scrollHeight;
+        subtitles.appendChild(newSubtitle);
+
+        // Keep only last 10 subtitles to prevent memory issues
+        while (subtitles.children.length > 10) {
+            subtitles.removeChild(subtitles.firstChild);
+        }
+
+        // Auto-scroll to the latest subtitle
+        subtitles.scrollTop = subtitles.scrollHeight;
     }
 
     function enqueueAudio(base64Audio) {
         audioQueue.push(base64Audio);
         processAudioQueue();
+    }
+
+    function cleanupBlobUrl(url) {
+        if (blobUrls.has(url)) {
+            URL.revokeObjectURL(url);
+            blobUrls.delete(url);
+        }
     }
 
     function processAudioQueue() {
@@ -68,62 +104,122 @@ document.addEventListener('DOMContentLoaded', () => {
         isPlaying = true;
         const base64Audio = audioQueue.shift();
 
-        // Decode the base64 audio string to binary data
-        const binaryString = window.atob(base64Audio);
-        const len = binaryString.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-        }
+        try {
+            // Decode the base64 audio string to binary data
+            const binaryString = window.atob(base64Audio);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
 
-        // Create a Blob from the binary data
-        const blob = new Blob([bytes.buffer], { type: 'audio/wav' });
-        const audioUrl = URL.createObjectURL(blob);
+            // Create a Blob from the binary data
+            const blob = new Blob([bytes.buffer], { type: 'audio/wav' });
+            const audioUrl = URL.createObjectURL(blob);
+            blobUrls.add(audioUrl);
 
-        // Set the source of the audio player
-        audioPlayer.src = audioUrl;
+            // Clean up previous audio URL
+            if (audioPlayer.src) {
+                cleanupBlobUrl(audioPlayer.src);
+            }
 
-        // Play the audio
-        audioPlayer.play().then(() => {
-            console.log('Playing audio...');
-        }).catch(error => {
-            console.error('Error playing audio:', error);
-            isPlaying = false;
-            processAudioQueue(); // Attempt to play the next audio
-        });
+            // Set the source of the audio player
+            audioPlayer.src = audioUrl;
 
-        // Listen for the end of the audio playback
-        audioPlayer.onended = () => {
+            // Calculate the scheduled start time
+            if (!scheduledStartTime) {
+                scheduledStartTime = Date.now() + fixedDelay;
+            }
+
+            const delay = scheduledStartTime - Date.now();
+
+            // Play the audio after the calculated delay
+            setTimeout(() => {
+                audioPlayer.play().then(() => {
+                    console.log('Playing translated audio...');
+                }).catch(error => {
+                    console.error('Error playing translated audio:', error);
+                    isPlaying = false;
+                    cleanupBlobUrl(audioUrl);
+                    processAudioQueue(); // Attempt to play the next audio
+                });
+            }, Math.max(delay, 0));
+
+            // Listen for the end of the audio playback
+            audioPlayer.onended = () => {
+                isPlaying = false;
+                cleanupBlobUrl(audioUrl);
+                scheduledStartTime = Date.now() + fixedDelay;
+                processAudioQueue();
+            };
+
+            // Update the scheduled start time for the next audio
+            scheduledStartTime += fixedDelay;
+
+        } catch (error) {
+            console.error('Error processing audio:', error);
             isPlaying = false;
             processAudioQueue();
+        }
+    }
+
+    async function attemptReconnect() {
+        const retryInterval = 5000; // 5 seconds
+        
+        // Clean up existing connection
+        if (socket) {
+            socket.close();
+        }
+
+        await new Promise(resolve => setTimeout(resolve, retryInterval));
+
+        console.log('Attempting to reconnect WebSocket...');
+        displaySubtitles('Reconnecting...');
+
+        // Re-initialize the WebSocket connection
+        socket = new WebSocket(socketUrl);
+
+        // Reattach all event handlers
+        socket.onopen = () => {
+            console.log('WebSocket reconnected');
+            clearSubtitles();
+            displaySubtitles('Reconnected to server. Waiting for translation...');
+        };
+
+        socket.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.type === 'translation') {
+                    displaySubtitles(data.text);
+                } else if (data.type === 'audio') {
+                    enqueueAudio(data.audio);
+                }
+            } catch (error) {
+                console.error('Error parsing WebSocket message:', error);
+            }
+        };
+
+        socket.onclose = (event) => {
+            console.log('WebSocket connection closed:', event);
+            displaySubtitles('Connection closed. Attempting to reconnect...');
+            attemptReconnect();
+        };
+
+        socket.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            displaySubtitles('WebSocket error. Check console for details.');
         };
     }
 
-    function displayConnectionStatus(status) {
-        const statusDiv = document.createElement('div');
-        statusDiv.textContent = status;
-        statusDiv.className = 'mb-2 p-2 bg-red-100 text-red-700 rounded';
-        translationDisplay.appendChild(statusDiv);
-        translationDisplay.scrollTop = translationDisplay.scrollHeight;
-    }
-
-    function attemptReconnect() {
-        const retryInterval = 5000; // 5 seconds
-        setTimeout(() => {
-            console.log('Attempting to reconnect WebSocket...');
-            // Re-initialize the WebSocket connection
-            const newSocket = new WebSocket(`${protocol}://${window.location.host}/ws/translations`);
-
-            newSocket.onopen = () => {
-                console.log('WebSocket reconnected');
-                displayConnectionStatus('Reconnected to server.');
-                // Replace the old socket with the new one
-                socket = newSocket;
-            };
-
-            newSocket.onmessage = socket.onmessage;
-            newSocket.onclose = socket.onclose;
-            newSocket.onerror = socket.onerror;
-        }, retryInterval);
-    }
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+        // Clean up all blob URLs
+        blobUrls.forEach(url => {
+            cleanupBlobUrl(url);
+        });
+        
+        // Close WebSocket connection
+        if (socket) {
+            socket.close();
+        }
+    });
 });
