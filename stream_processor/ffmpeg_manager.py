@@ -12,14 +12,14 @@ class FFmpegManager:
         self.input_stream_url = input_stream_url
         self.output_rtmp_url = output_rtmp_url
         self.input_audio_pipe = input_audio_pipe
-        self.translated_audio_pipe = translated_audio_pipe
+        # self.translated_audio_pipe = translated_audio_pipe
         self.zmq_address = zmq_address.replace('tcp://', '')
         self.ffmpeg_process = None
         self.logger = logging.getLogger(__name__)
         self.running = True
 
         # Create named pipes if they don't exist
-        for pipe in [self.input_audio_pipe, self.translated_audio_pipe]:
+        for pipe in [self.input_audio_pipe]:
             try:
                 os.mkfifo(pipe)
             except FileExistsError:
@@ -148,7 +148,7 @@ class FFmpegManager:
                 self.logger.info("FFmpeg process stopped")
 
         # Clean up named pipes
-        for pipe in [self.input_audio_pipe, self.translated_audio_pipe]:
+        for pipe in [self.input_audio_pipe]:
             try:
                 if os.path.exists(pipe):
                     os.unlink(pipe)

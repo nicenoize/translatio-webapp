@@ -10,16 +10,15 @@ import wave
 import struct
 from fastapi import WebSocket
 import time
-import subprocess
+import errno
+
 
 class OpenAIClient:
-    def __init__(self, api_key: str, translated_audio_pipe: str):
+    def __init__(self, api_key: str):
         self.api_key = api_key
         self.ws = None
         self.logger = logging.getLogger(__name__)
-        self.translated_audio_pipe = translated_audio_pipe
         self.websocket_clients: Dict[int, WebSocket] = {}
-        self.rtmp_link = 'rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live'
         self.response_in_progress = False  # Track if a response is in progress
 
         # Initialize audio buffers and synchronization variables
@@ -36,39 +35,23 @@ class OpenAIClient:
 
         # Create directories for output if they don't exist
         os.makedirs('output/transcripts', exist_ok=True)
-        os.makedirs('output/audio/input', exist_ok=True)
-        os.makedirs('output/audio/output', exist_ok=True)
+        os.makedirs('output/audio', exist_ok=True)
         self.transcript_file = open('output/transcripts/transcript.txt', 'w', encoding='utf-8')
         self.audio_counter = 0
 
-        # Start FFmpeg process to stream audio to RTMP server
-        self.ffmpeg_process = self.start_ffmpeg_stream()
-        self.ffmpeg_log_task = asyncio.create_task(self.read_ffmpeg_logs())
+        # Path to the named pipe for translated audio
+        self.translated_audio_pipe_path = 'translated_audio_pipe'
+        self.create_named_pipe()
 
-    def start_ffmpeg_stream(self):
-        """Start an FFmpeg process to stream audio data to the RTMP server"""
-        command = [
-            'ffmpeg',
-            '-re',
-            '-f', 's16le',
-            '-ar', '24000',  # Audio sample rate
-            '-ac', '1',       # Mono audio
-            '-i', '-',        # Read audio from stdin
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-f', 'flv',
-            self.rtmp_link
-        ]
-        return subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Add a lock for reconnecting to prevent race conditions
+        self.reconnect_lock = asyncio.Lock()
+        self.is_reconnecting = False
 
-    async def read_ffmpeg_logs(self):
-        """Read FFmpeg process stderr output"""
-        while True:
-            line = await asyncio.get_event_loop().run_in_executor(None, self.ffmpeg_process.stderr.readline)
-            if line:
-                self.logger.info(f"FFmpeg: {line.decode().strip()}")
-            else:
-                break
+    def create_named_pipe(self):
+        """Create a named pipe for translated audio output"""
+        if not os.path.exists(self.translated_audio_pipe_path):
+            os.mkfifo(self.translated_audio_pipe_path)
+            self.logger.info(f"Created named pipe at {self.translated_audio_pipe_path}")
 
     async def connect(self):
         """Connect to OpenAI's Realtime API and initialize session"""
@@ -77,9 +60,28 @@ class OpenAIClient:
             "Authorization": f"Bearer {self.api_key}",
             "OpenAI-Beta": "realtime=v1"
         }
-        self.ws = await websockets.connect(url, extra_headers=headers)
-        self.logger.info("Connected to OpenAI Realtime API")
 
+        # Add reconnection attempts
+        max_retries = 5
+        retry_delay = 5  # seconds
+        for attempt in range(max_retries):
+            try:
+                self.ws = await websockets.connect(url, extra_headers=headers)
+                self.logger.info("Connected to OpenAI Realtime API")
+                break
+            except Exception as e:
+                self.logger.error(f"Connection attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    self.logger.info(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    self.logger.error("Max connection attempts reached. Exiting.")
+                    raise
+
+        await self.init_conversation()
+
+    async def init_conversation(self):
+        """Initialize conversation context"""
         # Configure session with server-side VAD and other settings
         session_update = {
             "type": "session.update",
@@ -120,11 +122,7 @@ class OpenAIClient:
                 "modalities": ["text", "audio"]
             }
         }
-        await self.ws.send(json.dumps(session_update))
-        await self.init_conversation()
-
-    async def init_conversation(self):
-        """Initialize conversation context"""
+        await self.safe_send(json.dumps(session_update))
         conversation_init = {
             "type": "conversation.item.create",
             "item": {
@@ -136,7 +134,35 @@ class OpenAIClient:
                 }]
             }
         }
-        await self.ws.send(json.dumps(conversation_init))
+        await self.safe_send(json.dumps(conversation_init))
+
+    async def safe_send(self, data):
+        """Send data over WebSocket with error handling and reconnection"""
+        try:
+            if self.ws and self.ws.open:
+                await self.ws.send(data)
+            else:
+                self.logger.warning("WebSocket is closed. Attempting to reconnect...")
+                await self.reconnect()
+                await self.ws.send(data)
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
+            self.logger.error(f"WebSocket connection closed during send: {e}")
+            await self.reconnect()
+            await self.ws.send(data)
+        except Exception as e:
+            self.logger.error(f"Exception during WebSocket send: {e}", exc_info=True)
+            raise
+
+    async def reconnect(self):
+        """Reconnect to the WebSocket server"""
+        async with self.reconnect_lock:
+            if self.is_reconnecting:
+                return
+            self.is_reconnecting = True
+            self.logger.info("Reconnecting to OpenAI Realtime API...")
+            await self.disconnect()
+            await self.connect()
+            self.is_reconnecting = False
 
     async def send_audio_chunk(self, base64_audio: str):
         """Append audio chunk to buffer and send when buffer size is sufficient"""
@@ -158,48 +184,57 @@ class OpenAIClient:
                     self.audio_chunk_id += 1
                     chunk_id = self.audio_chunk_id
 
-                    # Store the timestamp and sent time of this chunk
-                    self.sent_chunks[chunk_id] = {
-                        'timestamp': self.timestamp_buffer[0],  # Use the earliest timestamp
-                        'sent_time': time.time()
-                    }
-
                     # Prepare the event to send to OpenAI
                     append_event = {
                         "type": "input_audio_buffer.append",
                         "audio": base64.b64encode(self.outgoing_audio_buffer).decode('utf-8')
-                        # Note: The API may not accept additional fields like 'chunk_id'
                     }
-                    await self.ws.send(json.dumps(append_event))
+                    await self.safe_send(json.dumps(append_event))
+
+                    # Send commit event
+                    commit_event = {"type": "input_audio_buffer.commit"}
+                    await self.safe_send(json.dumps(commit_event))
 
                     self.logger.info(f"Sent audio buffer of size: {len(self.outgoing_audio_buffer)} bytes, chunk_id: {chunk_id}")
-
-                    # Update the time when the last audio chunk was sent
-                    self.last_audio_chunk_sent_time = time.time()
 
                     # Reset buffers
                     self.outgoing_audio_buffer = bytearray()
                     self.timestamp_buffer = []
 
-                    # Create a response if none is in progress
-                    if not self.response_in_progress:
-                        response_event = {
-                            "type": "response.create",
-                            "response": {
-                                "modalities": ["text", "audio"]
-                            }
-                        }
-                        await self.ws.send(json.dumps(response_event))
-                        self.response_in_progress = True
-
         except Exception as e:
             self.logger.error(f"Error sending audio chunk: {e}", exc_info=True)
+
+
 
     async def handle_responses(self):
         """Handle translation responses from OpenAI"""
         try:
+            # Open the named pipe for writing translated audio in non-blocking mode
+            try:
+                pipe_fd = os.open(self.translated_audio_pipe_path, os.O_WRONLY | os.O_NONBLOCK)
+                pipe = os.fdopen(pipe_fd, 'wb')
+                self.logger.info("Opened named pipe for writing.")
+            except OSError as e:
+                if e.errno == errno.ENXIO:
+                    self.logger.error("No reader is connected to the named pipe.")
+                    pipe = None
+                else:
+                    self.logger.error(f"Error opening named pipe: {e}")
+                    pipe = None
+
             while True:
-                response = await self.ws.recv()
+                try:
+                    response = await self.ws.recv()
+                    print('Response: ', response)
+                except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
+                    self.logger.error(f"WebSocket connection closed during recv: {e}")
+                    await self.reconnect()
+                    continue  # Attempt to receive again after reconnecting
+                except Exception as e:
+                    self.logger.error(f"Exception during WebSocket recv: {e}", exc_info=True)
+                    await self.reconnect()
+                    continue
+
                 event = json.loads(response)
                 event_type = event.get("type")
 
@@ -221,9 +256,17 @@ class OpenAIClient:
                                 self.latency_compensation = sum(self.latency_measurements) / len(self.latency_measurements)
                                 self.last_audio_chunk_sent_time = None  # Reset after measuring latency
 
-                            # Schedule playback considering latency compensation
-                            playback_time = current_time + self.latency_compensation
-                            asyncio.create_task(self.play_audio_at_time(decoded_audio, playback_time))
+                            # Write the audio data to the named pipe if it's open
+                            if pipe:
+                                try:
+                                    pipe.write(decoded_audio)
+                                    pipe.flush()
+                                except BrokenPipeError:
+                                    self.logger.error("BrokenPipeError: No reader connected to the named pipe.")
+                                    pipe.close()
+                                    pipe = None
+                            else:
+                                self.logger.warning("No pipe to write audio data.")
 
                         except Exception as e:
                             self.logger.error(f"Error handling audio data: {e}")
@@ -233,6 +276,8 @@ class OpenAIClient:
                     if text.strip():
                         # Handle text as needed (e.g., display or log)
                         self.logger.info(f"Translated text: {text}")
+                        # Optionally broadcast to connected WebSocket clients
+                        await self.broadcast_translation(text)
 
                 elif event_type == "response.done":
                     # Reset the response in progress flag
@@ -244,25 +289,12 @@ class OpenAIClient:
                     # Reset the response in progress flag on error
                     self.response_in_progress = False
 
-        except websockets.exceptions.ConnectionClosed as e:
-            self.logger.error(f"WebSocket connection closed: {e}")
         except Exception as e:
-            self.logger.error(f"Error handling OpenAI responses: {e}")
+            self.logger.error(f"Error handling OpenAI responses: {e}", exc_info=True)
         finally:
+            if pipe:
+                pipe.close()
             await self.disconnect()
-
-    async def play_audio_at_time(self, audio_data: bytes, playback_time: float):
-        """Play the audio data at the specified playback_time"""
-        delay = playback_time - time.time()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        # Write the audio data to FFmpeg stdin for streaming
-        if self.ffmpeg_process and self.ffmpeg_process.stdin:
-            try:
-                self.ffmpeg_process.stdin.write(audio_data)
-                self.ffmpeg_process.stdin.flush()
-            except BrokenPipeError:
-                self.logger.error("FFmpeg process has terminated unexpectedly.")
 
     async def register_websocket(self, websocket: WebSocket) -> int:
         """Register a new WebSocket client"""
@@ -292,23 +324,6 @@ class OpenAIClient:
         for client_id in disconnected_clients:
             await self.unregister_websocket(client_id)
 
-    def wrap_pcm_in_wav(self, pcm_data: bytes, sample_rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
-        """Wrap PCM data in WAV format"""
-        try:
-            num_samples = len(pcm_data) // (sample_width * channels)
-            byte_rate = sample_rate * channels * sample_width
-            block_align = channels * sample_width
-            data_size = len(pcm_data)
-            fmt_chunk = struct.pack('<4sIHHIIHH',
-                                    b'fmt ', 16, 1, channels, sample_rate,
-                                    byte_rate, block_align, sample_width * 8)
-            data_chunk = struct.pack('<4sI', b'data', data_size)
-            wav_header = struct.pack('<4sI4s', b'RIFF', 36 + data_size, b'WAVE') + fmt_chunk + data_chunk
-            return wav_header + pcm_data
-        except Exception as e:
-            self.logger.error(f"Error wrapping PCM data into WAV: {e}", exc_info=True)
-            return b''
-
     async def disconnect(self):
         """Disconnect from OpenAI and clean up resources"""
         if self.ws:
@@ -318,11 +333,9 @@ class OpenAIClient:
             except Exception as e:
                 self.logger.error(f"Error disconnecting from OpenAI: {e}")
 
-        if self.ffmpeg_process:
-            try:
-                self.ffmpeg_process.stdin.close()
-                self.ffmpeg_process.terminate()
-                await self.ffmpeg_process.wait()
-                self.logger.info("FFmpeg process terminated")
-            except Exception as e:
-                self.logger.error(f"Error terminating FFmpeg process: {e}")
+            self.ws = None  # Reset the WebSocket connection
+
+        # Remove the named pipe
+        if os.path.exists(self.translated_audio_pipe_path):
+            os.remove(self.translated_audio_pipe_path)
+            self.logger.info(f"Removed named pipe at {self.translated_audio_pipe_path}")
