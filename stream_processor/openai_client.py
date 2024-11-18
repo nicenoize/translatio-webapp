@@ -11,6 +11,8 @@ import wave
 import struct
 from fastapi import WebSocket
 import time
+import webrtcvad
+import subprocess
 
 class OpenAIClient:
     def __init__(self, api_key: str, translated_audio_pipe: str):
@@ -19,6 +21,12 @@ class OpenAIClient:
         self.logger = logging.getLogger(__name__)
         self.translated_audio_pipe = translated_audio_pipe
         self.websocket_clients: Dict[int, WebSocket] = {}
+        self.vad = webrtcvad.Vad()
+        self.vad.set_mode(1)  # 0: Aggressive, 3: Very Aggressive
+        self.silence_duration = 0
+        self.silence_threshold = 1.0  # seconds
+        self.rtmp_link = 'rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live'
+        self.ffmpeg_process = self.start_ffmpeg_stream()
         
         if not os.path.exists(self.translated_audio_pipe):
             raise FileNotFoundError(f"Named pipe not found: {self.translated_audio_pipe}")
@@ -45,6 +53,49 @@ class OpenAIClient:
         self.min_buffer_size = 240000  # 5 seconds buffer
         self.current_translation = ""
         self.translation_buffer = []
+
+
+    def start_ffmpeg_stream(self):
+        """Start an ffmpeg process to stream audio data to the RTMP server"""
+        command = [
+            'ffmpeg',
+            '-re',
+            '-f', 's16le',
+            '-ar', '24000',
+            '-ac', '1',
+            '-i', '-',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-f', 'flv',
+            self.rtmp_link
+        ]
+        return subprocess.Popen(command, stdin=subprocess.PIPE)
+    
+    def should_commit_audio(self):
+        """Determine if audio should be committed based on silence detection"""
+        # Analyze the last chunk of audio for silence
+        frame_duration = 20  # ms
+        num_bytes_per_frame = int(24000 * 2 * (frame_duration / 1000))  # sample_rate * sample_width * duration
+        if len(self.outgoing_audio_buffer) < num_bytes_per_frame:
+            return False
+
+        frames = [self.outgoing_audio_buffer[i:i+num_bytes_per_frame] 
+                  for i in range(0, len(self.outgoing_audio_buffer), num_bytes_per_frame)]
+        
+        is_speech = False
+        for frame in frames[-5:]:  # Check the last 100ms
+            if self.vad.is_speech(frame, 24000):
+                is_speech = True
+                break
+
+        if not is_speech:
+            self.silence_duration += frame_duration / 1000.0
+        else:
+            self.silence_duration = 0
+
+        if self.silence_duration >= self.silence_threshold:
+            return True
+        return False
 
     async def connect(self):
         """Connect to OpenAI's Realtime API"""
@@ -108,7 +159,7 @@ class OpenAIClient:
                 "role": "system",
                 "content": [{
                     "type": "input_text",
-                    "text": "You are a real-time English to German translator. Translate naturally and maintain the original tone."
+                    "text": "You are a real-time English to German translator. Try to maintain the original tone and emotion of the input."
                 }]
             }
         }
