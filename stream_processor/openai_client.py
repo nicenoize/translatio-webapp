@@ -11,6 +11,8 @@ import struct
 from fastapi import WebSocket
 import time
 import subprocess
+import numpy as np
+import simpleaudio as sa  # For playing audio locally
 
 class OpenAIClient:
     def __init__(self, api_key: str, translated_audio_pipe: str):
@@ -25,7 +27,7 @@ class OpenAIClient:
         # Initialize audio buffers and synchronization variables
         self.outgoing_audio_buffer = bytearray()
         self.audio_buffer_lock = asyncio.Lock()
-        self.min_buffer_size = 24000  # Buffer size for 0.5 seconds of audio at 24000 Hz
+        self.min_buffer_size = 24000  # Correct buffer size for 0.5 seconds of audio at 24000 Hz
         self.timestamp_buffer = []  # Store timestamps of audio chunks
         self.audio_chunk_id = 0  # Unique ID for each audio chunk
         self.sent_chunks = {}  # Map chunk IDs to timestamps
@@ -44,6 +46,16 @@ class OpenAIClient:
         # Start FFmpeg process to stream audio to RTMP server
         self.ffmpeg_process = self.start_ffmpeg_stream()
         self.ffmpeg_log_task = asyncio.create_task(self.read_ffmpeg_logs())
+
+        # Add a lock for reconnecting to prevent race conditions
+        self.is_reconnecting = False
+        self.reconnect_lock = asyncio.Lock()
+
+        # Initialize WAV file for output
+        self.output_wav = wave.open('output/audio/output_audio.wav', 'wb')
+        self.output_wav.setnchannels(1)
+        self.output_wav.setsampwidth(2)  # 16-bit PCM
+        self.output_wav.setframerate(24000)
 
     def start_ffmpeg_stream(self):
         """Start an FFmpeg process to stream audio data to the RTMP server"""
@@ -120,7 +132,7 @@ class OpenAIClient:
                 "modalities": ["text", "audio"]
             }
         }
-        await self.ws.send(json.dumps(session_update))
+        await self.safe_send(json.dumps(session_update))
         await self.init_conversation()
 
     async def init_conversation(self):
@@ -136,7 +148,35 @@ class OpenAIClient:
                 }]
             }
         }
-        await self.ws.send(json.dumps(conversation_init))
+        await self.safe_send(json.dumps(conversation_init))
+
+    async def safe_send(self, data):
+        """Send data over WebSocket with error handling and reconnection"""
+        try:
+            if self.ws and self.ws.open:
+                await self.ws.send(data)
+            else:
+                self.logger.warning("WebSocket is closed. Attempting to reconnect...")
+                await self.reconnect()
+                await self.ws.send(data)
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
+            self.logger.error(f"WebSocket connection closed during send: {e}")
+            await self.reconnect()
+            await self.ws.send(data)
+        except Exception as e:
+            self.logger.error(f"Exception during WebSocket send: {e}", exc_info=True)
+            raise
+
+    async def reconnect(self):
+        """Reconnect to the WebSocket server"""
+        async with self.reconnect_lock:
+            if self.is_reconnecting:
+                return
+            self.is_reconnecting = True
+            self.logger.info("Reconnecting to OpenAI Realtime API...")
+            await self.disconnect()
+            await self.connect()
+            self.is_reconnecting = False
 
     async def send_audio_chunk(self, base64_audio: str):
         """Append audio chunk to buffer and send when buffer size is sufficient"""
@@ -158,19 +198,16 @@ class OpenAIClient:
                     self.audio_chunk_id += 1
                     chunk_id = self.audio_chunk_id
 
-                    # Store the timestamp and sent time of this chunk
-                    self.sent_chunks[chunk_id] = {
-                        'timestamp': self.timestamp_buffer[0],  # Use the earliest timestamp
-                        'sent_time': time.time()
-                    }
-
                     # Prepare the event to send to OpenAI
                     append_event = {
                         "type": "input_audio_buffer.append",
                         "audio": base64.b64encode(self.outgoing_audio_buffer).decode('utf-8')
-                        # Note: The API may not accept additional fields like 'chunk_id'
                     }
-                    await self.ws.send(json.dumps(append_event))
+                    await self.safe_send(json.dumps(append_event))
+
+                    # Send commit event
+                    commit_event = {"type": "input_audio_buffer.commit"}
+                    await self.safe_send(json.dumps(commit_event))
 
                     self.logger.info(f"Sent audio buffer of size: {len(self.outgoing_audio_buffer)} bytes, chunk_id: {chunk_id}")
 
@@ -181,17 +218,6 @@ class OpenAIClient:
                     self.outgoing_audio_buffer = bytearray()
                     self.timestamp_buffer = []
 
-                    # Create a response if none is in progress
-                    if not self.response_in_progress:
-                        response_event = {
-                            "type": "response.create",
-                            "response": {
-                                "modalities": ["text", "audio"]
-                            }
-                        }
-                        await self.ws.send(json.dumps(response_event))
-                        self.response_in_progress = True
-
         except Exception as e:
             self.logger.error(f"Error sending audio chunk: {e}", exc_info=True)
 
@@ -199,7 +225,17 @@ class OpenAIClient:
         """Handle translation responses from OpenAI"""
         try:
             while True:
-                response = await self.ws.recv()
+                try:
+                    response = await self.ws.recv()
+                except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
+                    self.logger.error(f"WebSocket connection closed during recv: {e}")
+                    await self.reconnect()
+                    continue  # Attempt to receive again after reconnecting
+                except Exception as e:
+                    self.logger.error(f"Exception during WebSocket recv: {e}", exc_info=True)
+                    await self.reconnect()
+                    continue
+
                 event = json.loads(response)
                 event_type = event.get("type")
 
@@ -233,6 +269,8 @@ class OpenAIClient:
                     if text.strip():
                         # Handle text as needed (e.g., display or log)
                         self.logger.info(f"Translated text: {text}")
+                        # Optionally broadcast to connected WebSocket clients
+                        await self.broadcast_translation(text)
 
                 elif event_type == "response.done":
                     # Reset the response in progress flag
@@ -244,10 +282,8 @@ class OpenAIClient:
                     # Reset the response in progress flag on error
                     self.response_in_progress = False
 
-        except websockets.exceptions.ConnectionClosed as e:
-            self.logger.error(f"WebSocket connection closed: {e}")
         except Exception as e:
-            self.logger.error(f"Error handling OpenAI responses: {e}")
+            self.logger.error(f"Error handling OpenAI responses: {e}", exc_info=True)
         finally:
             await self.disconnect()
 
@@ -263,6 +299,20 @@ class OpenAIClient:
                 self.ffmpeg_process.stdin.flush()
             except BrokenPipeError:
                 self.logger.error("FFmpeg process has terminated unexpectedly.")
+
+        # Write the audio data to the output WAV file
+        if self.output_wav:
+            self.output_wav.writeframes(audio_data)
+
+        # Optionally, play the audio data using simpleaudio
+        try:
+            # Convert the audio data to numpy array
+            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            # Play the audio data
+            play_obj = sa.play_buffer(audio_array, 1, 2, 24000)
+            # Do not wait for playback to finish
+        except Exception as e:
+            self.logger.error(f"Error playing audio: {e}")
 
     async def register_websocket(self, websocket: WebSocket) -> int:
         """Register a new WebSocket client"""
@@ -292,23 +342,6 @@ class OpenAIClient:
         for client_id in disconnected_clients:
             await self.unregister_websocket(client_id)
 
-    def wrap_pcm_in_wav(self, pcm_data: bytes, sample_rate: int = 24000, channels: int = 1, sample_width: int = 2) -> bytes:
-        """Wrap PCM data in WAV format"""
-        try:
-            num_samples = len(pcm_data) // (sample_width * channels)
-            byte_rate = sample_rate * channels * sample_width
-            block_align = channels * sample_width
-            data_size = len(pcm_data)
-            fmt_chunk = struct.pack('<4sIHHIIHH',
-                                    b'fmt ', 16, 1, channels, sample_rate,
-                                    byte_rate, block_align, sample_width * 8)
-            data_chunk = struct.pack('<4sI', b'data', data_size)
-            wav_header = struct.pack('<4sI4s', b'RIFF', 36 + data_size, b'WAVE') + fmt_chunk + data_chunk
-            return wav_header + pcm_data
-        except Exception as e:
-            self.logger.error(f"Error wrapping PCM data into WAV: {e}", exc_info=True)
-            return b''
-
     async def disconnect(self):
         """Disconnect from OpenAI and clean up resources"""
         if self.ws:
@@ -317,6 +350,7 @@ class OpenAIClient:
                 self.logger.info("Disconnected from OpenAI Realtime API")
             except Exception as e:
                 self.logger.error(f"Error disconnecting from OpenAI: {e}")
+            self.ws = None  # Reset the WebSocket connection
 
         if self.ffmpeg_process:
             try:
@@ -326,3 +360,10 @@ class OpenAIClient:
                 self.logger.info("FFmpeg process terminated")
             except Exception as e:
                 self.logger.error(f"Error terminating FFmpeg process: {e}")
+
+        if self.output_wav:
+            try:
+                self.output_wav.close()
+                self.logger.info("Output WAV file closed")
+            except Exception as e:
+                self.logger.error(f"Error closing output WAV file: {e}")
