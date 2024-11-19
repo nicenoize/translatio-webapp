@@ -11,7 +11,7 @@ import numpy as np
 import simpleaudio as sa  # For playing audio locally
 import subprocess
 from asyncio import PriorityQueue
-
+from collections import defaultdict
 
 class OpenAIClient:
     def __init__(self, api_key: str, translated_audio_pipe: str):
@@ -32,9 +32,23 @@ class OpenAIClient:
         # Initialize FFmpeg
         self.ffmpeg_process = self.start_ffmpeg_stream()
         self.ffmpeg_log_task = asyncio.create_task(self.read_ffmpeg_logs())
-        self.audio_queue = PriorityQueue()  # Maintain PriorityQueue for ordering
+
+        # Initialize separate queues for playback and FFmpeg
+        self.playback_queue = PriorityQueue()
+        self.ffmpeg_queue = PriorityQueue()
+
+        # Initialize playback buffer
+        self.playback_buffer = defaultdict(bytes)  # Buffer to store out-of-order chunks
+        self.playback_sequence = 0  # Expected sequence number for playback
+        self.playback_event = asyncio.Event()  # Event to signal available audio
+
+        # Initialize a separate sequence counter for audio chunks
+        self.audio_sequence = 0  # Tracks the next expected audio sequence number
+
+        # Create tasks for playback and FFmpeg writing
+        self.playback_task = asyncio.create_task(self.audio_playback_handler())
         self.ffmpeg_writer_task = asyncio.create_task(self.ffmpeg_writer())
-        self.current_sequence = 0  # Tracks the current expected sequence
+        self.current_sequence = 0  # Tracks the current expected sequence for FFmpeg
 
         # Add a lock for reconnecting to prevent race conditions
         self.is_reconnecting = False
@@ -75,15 +89,14 @@ class OpenAIClient:
                 # Attempt to restart FFmpeg
                 self.ffmpeg_process = self.start_ffmpeg_stream()
                 self.ffmpeg_log_task = asyncio.create_task(self.read_ffmpeg_logs())
-                # Do NOT reassign audio_queue or recreate ffmpeg_writer_task here
-                # The existing writer task should continue using the new FFmpeg process
+                # The existing ffmpeg_writer_task will continue using the new FFmpeg process
                 break
 
     async def ffmpeg_writer(self):
-        """Dedicated coroutine to write ordered audio data to FFmpeg's stdin"""
+        """Dedicated coroutine to write ordered audio data to FFmpeg's stdin from ffmpeg_queue"""
         buffer = {}
         while True:
-            item = await self.audio_queue.get()
+            item = await self.ffmpeg_queue.get()
             if item is None:
                 self.logger.info("FFmpeg writer received shutdown signal.")
                 break  # Allows graceful shutdown
@@ -95,6 +108,7 @@ class OpenAIClient:
                         self.ffmpeg_process.stdin.write(audio_data)
                         self.ffmpeg_process.stdin.flush()
                     self.current_sequence += 1
+                    self.logger.debug(f"Written audio chunk to FFmpeg: {sequence}")
                 except BrokenPipeError:
                     self.logger.error("FFmpeg process has terminated unexpectedly.")
                     # FFmpeg restart is handled in read_ffmpeg_logs
@@ -106,18 +120,63 @@ class OpenAIClient:
                             self.ffmpeg_process.stdin.write(buffered_data)
                             self.ffmpeg_process.stdin.flush()
                         self.current_sequence += 1
+                        self.logger.debug(f"Written buffered audio chunk to FFmpeg: {self.current_sequence}")
                     except BrokenPipeError:
                         self.logger.error("FFmpeg process has terminated unexpectedly.")
                         break  # Exit the loop if FFmpeg terminates
             elif sequence > self.current_sequence:
                 # Future sequence, store in buffer
                 buffer[sequence] = audio_data
-                self.logger.debug(f"Buffered out-of-order chunk: {sequence}")
+                self.logger.debug(f"Buffered out-of-order chunk for FFmpeg: {sequence}")
             else:
                 # Duplicate or old sequence, ignore or handle accordingly
-                self.logger.warning(f"Received duplicate or old chunk: {sequence}")
+                self.logger.warning(f"Received duplicate or old FFmpeg chunk: {sequence}")
 
-            self.audio_queue.task_done()
+            self.ffmpeg_queue.task_done()
+
+    async def audio_playback_handler(self):
+        """Handle ordered playback of audio chunks from playback_queue"""
+        while True:
+            await self.playback_event.wait()
+            while not self.playback_queue.empty():
+                sequence, audio_data = await self.playback_queue.get()
+                if sequence == self.playback_sequence:
+                    await self.process_playback_chunk(sequence, audio_data)
+                    self.playback_sequence += 1
+                    # Check if the next sequences are already in the buffer
+                    while self.playback_sequence in self.playback_buffer:
+                        buffered_data = self.playback_buffer.pop(self.playback_sequence)
+                        await self.process_playback_chunk(self.playback_sequence, buffered_data)
+                        self.playback_sequence += 1
+                elif sequence > self.playback_sequence:
+                    # Future chunk, store in buffer
+                    self.playback_buffer[sequence] = audio_data
+                    self.logger.debug(f"Buffered out-of-order chunk for playback: {sequence}")
+                else:
+                    # Duplicate or old chunk, ignore
+                    self.logger.warning(f"Ignoring duplicate or old playback chunk: {sequence}")
+                self.playback_queue.task_done()
+            self.playback_event.clear()
+
+    async def process_playback_chunk(self, sequence: int, audio_data: bytes):
+        """Process and play a single audio chunk for playback"""
+        # Write to the output WAV file
+        if self.output_wav:
+            self.output_wav.writeframes(audio_data)
+            self.logger.debug(f"Written audio chunk {sequence} to WAV file")
+        
+        # Play the audio using simpleaudio
+        try:
+            # Convert the audio data to numpy array
+            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            # Create a WaveObject and play
+            play_obj = sa.play_buffer(audio_array, 1, 2, 24000)
+            play_obj.wait_done()  # Wait until playback is finished
+            self.logger.debug(f"Played audio chunk: {sequence}")
+        except Exception as e:
+            self.logger.error(f"Error playing audio chunk {sequence}: {e}")
+        
+        # No need to enqueue back into any queue
 
     async def connect(self):
         """Connect to OpenAI's Realtime API and initialize session"""
@@ -133,7 +192,7 @@ class OpenAIClient:
         session_update = {
             "type": "session.update",
             "session": {
-                "object": "realtime.session",  # Ensure this field is included
+                # "object": "realtime.session",  # Ensure this field is included
                 "model": "gpt-4o-realtime-preview-2024-10-01",
                 "modalities": ["text", "audio"],
                 "instructions": "You are a realtime translator. Please use the audio you receive and translate it into german. Try to match the tone, emotion and duration of the original audio.",
@@ -255,14 +314,15 @@ class OpenAIClient:
                 elif event_type == "input_audio_buffer.speech_stopped":
                     self.logger.info("Speech stopped")
                 elif event_type == "response.audio.delta":
-                    print("Received audio delta")
+                    self.logger.info("Received audio delta")
                     audio_data = event.get("delta", "")
-                    sequence = event.get("sequence", self.audio_counter)  # Extract sequence number
                     if audio_data:
                         try:
                             decoded_audio = base64.b64decode(audio_data)
-                            self.audio_counter += 1  # Increment local sequence counter if API doesn't provide it
-                            asyncio.create_task(self.play_audio(sequence, decoded_audio))
+                            sequence = self.audio_sequence  # Assign current sequence number
+                            await self.enqueue_audio(sequence, decoded_audio)
+                            self.audio_sequence += 1  # Increment for the next chunk
+                            self.logger.debug(f"Processed audio chunk: {sequence}")
                         except Exception as e:
                             self.logger.error(f"Error handling audio data: {e}")
                 elif event_type == "response.audio_transcript.delta":
@@ -278,24 +338,12 @@ class OpenAIClient:
         finally:
             await self.disconnect()
 
-    async def play_audio(self, sequence: int, audio_data: bytes):
-        """Play the audio data immediately with sequence management"""
-        # Write the audio data to the output WAV file
-        if self.output_wav:
-            self.output_wav.writeframes(audio_data)
-
-        # Optionally, play the audio data using simpleaudio
-        try:
-            # Convert the audio data to numpy array
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            # Play the audio data
-            sa.play_buffer(audio_array, 1, 2, 24000)
-        except Exception as e:
-            self.logger.error(f"Error playing audio: {e}")
-
-        # Enqueue audio data for FFmpeg with sequence number
-        if self.audio_queue:
-            await self.audio_queue.put((sequence, audio_data))
+    async def enqueue_audio(self, sequence: int, audio_data: bytes):
+        """Enqueue audio data with its sequence number into both playback and FFmpeg queues"""
+        await self.playback_queue.put((sequence, audio_data))
+        await self.ffmpeg_queue.put((sequence, audio_data))
+        self.logger.debug(f"Enqueued audio chunk: {sequence} into both queues")
+        self.playback_event.set()
 
     async def register_websocket(self, websocket: websockets.WebSocketServerProtocol) -> int:
         """Register a new WebSocket client"""
@@ -344,11 +392,17 @@ class OpenAIClient:
             except Exception as e:
                 self.logger.error(f"Error terminating FFmpeg process: {e}")
 
-        if self.audio_queue:
-            await self.audio_queue.put(None)
+        # Shutdown queues
+        if self.playback_queue:
+            await self.playback_queue.put(None)
+        if self.ffmpeg_queue:
+            await self.ffmpeg_queue.put(None)
+        if self.playback_task:
+            await self.playback_task
         if self.ffmpeg_writer_task:
             await self.ffmpeg_writer_task
 
+        # Close WAV file
         if self.output_wav:
             try:
                 self.output_wav.close()
