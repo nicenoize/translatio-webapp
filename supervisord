@@ -1,0 +1,20 @@
+[program:ffmpeg_extract]
+command=ffmpeg -i "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t" -vn -acodec pcm_s16le -ac 1 -ar 24000 -f s16le input_audio_pipe
+autostart=true
+autorestart=true
+stderr_logfile=/path/to/ffmpeg_extract.err.log
+stdout_logfile=/path/to/ffmpeg_extract.out.log
+
+[program:ffmpeg_stream]
+command=ffmpeg -loglevel debug -f s16le -ar 24000 -ac 1 -i translated_audio_pipe -i "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t" -vf subtitles=output/subtitles/subtitles.srt -c:v libx264 -c:a aac -b:a 128k -f flv -flags -global_header -fflags nobuffer -flush_packets 0 -shortest rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live
+autostart=true
+autorestart=true
+stderr_logfile=/path/to/ffmpeg_stream.err.log
+stdout_logfile=/path/to/ffmpeg_stream.out.log
+
+[program:python_app]
+command=python3 main.py
+autostart=true
+autorestart=true
+stderr_logfile=/path/to/python_app.err.log
+stdout_logfile=/path/to/python_app.out.log
