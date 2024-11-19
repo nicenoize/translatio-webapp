@@ -5,7 +5,6 @@ import logging
 from .openai_client import OpenAIClient
 import signal
 import os
-import subprocess
 from contextlib import suppress
 
 class StreamAudioProcessor:
@@ -73,25 +72,10 @@ class StreamAudioProcessor:
 
             self.logger.info("Starting StreamAudioProcessor...")
 
-            # Start FFmpeg Process 1 in the background to extract audio
-            ffmpeg_extract_command = [
-                'ffmpeg',
-                '-i', self.stream_url,  # Use the stream_url parameter
-                '-vn',
-                '-acodec', 'pcm_s16le',
-                '-ac', '1',
-                '-ar', '24000',
-                '-f', 's16le',
-                self.input_audio_pipe
-            ]
-
-            self.logger.info(f"Starting FFmpeg Process 1 to extract audio with command: {' '.join(ffmpeg_extract_command)}")
-            self.ffmpeg_extract_process = subprocess.Popen(
-                ffmpeg_extract_command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            # Ensure that the input_audio_pipe exists
+            if not os.path.exists(self.input_audio_pipe):
+                self.logger.error(f"Named pipe {self.input_audio_pipe} does not exist. Please create it before running.")
+                return
 
             # Start the OpenAIClient's main loop
             await self.openai_client.run()
@@ -116,17 +100,7 @@ class StreamAudioProcessor:
                     with suppress(asyncio.CancelledError):
                         await task
 
-            # Terminate FFmpeg Process 1
-            if hasattr(self, 'ffmpeg_extract_process') and self.ffmpeg_extract_process:
-                try:
-                    self.ffmpeg_extract_process.stdin.close()
-                    self.ffmpeg_extract_process.terminate()
-                    await asyncio.get_event_loop().run_in_executor(None, self.ffmpeg_extract_process.wait)
-                    self.logger.info("FFmpeg Process 1 terminated")
-                except Exception as e:
-                    self.logger.error(f"Error terminating FFmpeg Process 1: {e}")
-
             # Cleanup OpenAIClient
-            await self.openai_client.disconnect()
+            await self.openai_client.disconnect(shutdown=True)
 
             self.logger.info("Cleanup complete")
