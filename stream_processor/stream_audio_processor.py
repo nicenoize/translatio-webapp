@@ -2,58 +2,31 @@
 
 import asyncio
 import logging
-import signal
 from .openai_client import OpenAIClient
-from .audio_manager import AudioManager
-from .subtitle_manager import SubtitleManager
-from .ffmpeg_manager import FFmpegManager
+import signal
 import os
-import time
+import subprocess
 from contextlib import suppress
 
 class StreamAudioProcessor:
     def __init__(self, openai_api_key: str, stream_url: str, output_rtmp_url: str):
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.setup_logging()
 
         self.input_audio_pipe = 'input_audio_pipe'
         self.translated_audio_pipe = 'translated_audio_pipe'
         
-        # Create named pipes first
+        # Create named pipes if they don't exist
         self.create_named_pipes()
 
-        self.subtitle_manager = SubtitleManager()
-        self.audio_manager = AudioManager(self.input_audio_pipe)
-        self.openai_client = OpenAIClient(openai_api_key, self.translated_audio_pipe)
-        self.ffmpeg_manager = FFmpegManager(
-            stream_url,
-            output_rtmp_url,
-            self.input_audio_pipe,
-            self.translated_audio_pipe,
-            self.subtitle_manager.zmq_address
-        )
+        # Initialize OpenAIClient
+        self.openai_client = OpenAIClient(api_key=openai_api_key, translated_audio_pipe=self.translated_audio_pipe)
+        self.stream_url = stream_url
+        self.output_rtmp_url = output_rtmp_url
+
         self.tasks = []
         self.running = True
         self.cleanup_lock = asyncio.Lock()
-
-    def start_processing(self):
-        # Open the input named pipe in binary mode
-        with open(self.input_pipe_path, 'rb') as pipe:
-            print("Starting to stream audio data from input_audio_pipe to OpenAI real-time API...")
-            
-            while True:
-                # Read a chunk of data from the pipe
-                data = pipe.read(480000)  # Adjust chunk size as necessary
-                
-                if not data:
-                    time.sleep(0.01)  # Sleep briefly if no data is available
-                    continue
-                
-                # Send the chunk of data to the OpenAI client for processing
-                self.openai_client.send_audio_chunk(data)
-
-                # Optional: add a small sleep interval to control data flow
-                time.sleep(0.05)
 
     def create_named_pipes(self):
         """Create named pipes if they don't exist"""
@@ -92,34 +65,39 @@ class StreamAudioProcessor:
             # Setup signal handlers
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGTERM, signal.SIGINT):
-                loop.add_signal_handler(sig, self.signal_handler)
+                try:
+                    loop.add_signal_handler(sig, self.signal_handler)
+                except NotImplementedError:
+                    # Signal handlers are not implemented on some systems (e.g., Windows)
+                    pass
 
-            self.logger.info("Starting stream processor...")
-            await self.openai_client.connect()
+            self.logger.info("Starting StreamAudioProcessor...")
 
-            # Start FFmpeg process
-            self.ffmpeg_manager.start_ffmpeg_process()
-            
-            # Important: Set the FFmpeg process reference in AudioManager
-            self.audio_manager.set_ffmpeg_process(self.ffmpeg_manager.ffmpeg_process)
-
-            await asyncio.sleep(1)  # Give FFmpeg time to start
-
-            if self.ffmpeg_manager.ffmpeg_process.poll() is not None:
-                raise RuntimeError("FFmpeg failed to start")
-
-            self.tasks = [
-                asyncio.create_task(self.ffmpeg_manager.monitor_process()),
-                asyncio.create_task(self.audio_manager.process_audio(self.openai_client)),
-                asyncio.create_task(self.openai_client.handle_responses())
+            # Start FFmpeg Process 1 in the background to extract audio
+            ffmpeg_extract_command = [
+                'ffmpeg',
+                '-i', self.stream_url,  # Use the stream_url parameter
+                '-vn',
+                '-acodec', 'pcm_s16le',
+                '-ac', '1',
+                '-ar', '24000',
+                '-f', 's16le',
+                self.input_audio_pipe
             ]
 
-            # Wait for tasks to complete or running to become False
-            while self.running:
-                await asyncio.sleep(0.1)
+            self.logger.info(f"Starting FFmpeg Process 1 to extract audio with command: {' '.join(ffmpeg_extract_command)}")
+            self.ffmpeg_extract_process = subprocess.Popen(
+                ffmpeg_extract_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # Start the OpenAIClient's main loop
+            await self.openai_client.run()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamAudioProcessor: {e}")
+            self.logger.error(f"Error in StreamAudioProcessor: {e}", exc_info=True)
         finally:
             await self.cleanup()
 
@@ -129,7 +107,7 @@ class StreamAudioProcessor:
                 return
 
             self.running = False
-            self.logger.info("Cleaning up resources...")
+            self.logger.info("Cleaning up StreamAudioProcessor...")
 
             # Cancel all tasks
             for task in self.tasks:
@@ -138,10 +116,17 @@ class StreamAudioProcessor:
                     with suppress(asyncio.CancelledError):
                         await task
 
-            # Cleanup components
-            self.ffmpeg_manager.stop_ffmpeg_process()
-            self.audio_manager.cleanup()
-            self.subtitle_manager.cleanup()
+            # Terminate FFmpeg Process 1
+            if hasattr(self, 'ffmpeg_extract_process') and self.ffmpeg_extract_process:
+                try:
+                    self.ffmpeg_extract_process.stdin.close()
+                    self.ffmpeg_extract_process.terminate()
+                    await asyncio.get_event_loop().run_in_executor(None, self.ffmpeg_extract_process.wait)
+                    self.logger.info("FFmpeg Process 1 terminated")
+                except Exception as e:
+                    self.logger.error(f"Error terminating FFmpeg Process 1: {e}")
+
+            # Cleanup OpenAIClient
             await self.openai_client.disconnect()
 
             self.logger.info("Cleanup complete")
