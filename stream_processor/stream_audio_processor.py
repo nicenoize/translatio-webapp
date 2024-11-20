@@ -6,6 +6,8 @@ from .openai_client import OpenAIClient
 import signal
 import os
 from contextlib import suppress
+from collections import defaultdict
+
 
 class StreamAudioProcessor:
     def __init__(self, openai_api_key: str, stream_url: str, output_rtmp_url: str):
@@ -13,13 +15,17 @@ class StreamAudioProcessor:
         self.setup_logging()
 
         self.input_audio_pipe = 'input_audio_pipe'
-        self.translated_audio_pipe = 'translated_audio_pipe'
+        # self.translated_audio_pipe = 'translated_audio_pipe'  # No longer needed
         
         # Create named pipes if they don't exist
         self.create_named_pipes()
 
         # Initialize OpenAIClient
-        self.openai_client = OpenAIClient(api_key=openai_api_key, translated_audio_pipe=self.translated_audio_pipe)
+        self.openai_client = OpenAIClient(
+            api_key=openai_api_key,
+            stream_url=stream_url,
+            output_rtmp_url=output_rtmp_url
+        )
         self.stream_url = stream_url
         self.output_rtmp_url = output_rtmp_url
 
@@ -29,7 +35,7 @@ class StreamAudioProcessor:
 
     def create_named_pipes(self):
         """Create named pipes if they don't exist"""
-        for pipe in [self.input_audio_pipe, self.translated_audio_pipe]:
+        for pipe in [self.input_audio_pipe]:  # Removed translated_audio_pipe
             try:
                 if os.path.exists(pipe):
                     os.unlink(pipe)

@@ -7,24 +7,24 @@ import os
 import base64
 import pprint
 from typing import Dict
-import wave
-import numpy as np
-from asyncio import Queue
-from collections import defaultdict
 import datetime
 import srt
 import errno
 import subprocess
+from collections import defaultdict
+from contextlib import suppress
+
+from stream_processor.audio_saver import AudioSaver
 
 class OpenAIClient:
-    def __init__(self, api_key: str, translated_audio_pipe: str):
+    def __init__(self, api_key: str, stream_url: str, output_rtmp_url: str):
         self.api_key = api_key
+        self.stream_url = stream_url
+        self.output_rtmp_url = output_rtmp_url
         self.ws = None
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.translated_audio_pipe = translated_audio_pipe
         self.websocket_clients: Dict[int, websockets.WebSocketServerProtocol] = {}
-        self.output_rtmp_url = "rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live"
-        self.stream_url = 'https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t'
+        self.output_video_file = 'output/output_video.mp4'
 
         # Create directories for output if they don't exist
         os.makedirs('output/transcripts', exist_ok=True)
@@ -32,51 +32,75 @@ class OpenAIClient:
         os.makedirs('output/audio/output', exist_ok=True)
         os.makedirs('output/subtitles', exist_ok=True)
 
-        # Create named pipes if they don't exist
-        self.create_named_pipe('input_audio_pipe')
-        self.create_named_pipe(self.translated_audio_pipe)
+        # Named pipes
+        self.input_audio_pipe = 'input_audio_pipe'
+        self.translated_audio_pipe = 'translated_audio_pipe'
+        self.create_named_pipes()
 
+        # Transcript and subtitles
         self.transcript_file = open('output/transcripts/transcript.txt', 'w', encoding='utf-8')
-        self.audio_counter = 0
+        self.subtitle_file_path = 'output/subtitles/subtitles.srt'
+        # Initialize subtitles with a placeholder
+        self.initialize_subtitles()
 
-        # Initialize queues for playback
-        self.playback_queue = Queue()
-
-        # Initialize playback buffer
-        self.playback_buffer = defaultdict(bytes)  # Buffer to store out-of-order chunks
-        self.playback_sequence = 0  # Expected sequence number for playback
-        self.playback_event = asyncio.Event()  # Event to signal available audio
-
-        # Initialize a separate sequence counter for audio chunks
-        self.audio_sequence = 0  # Tracks the next expected audio sequence number
-
-        # Create task for playback
+        # Audio playback
+        self.playback_queue = asyncio.Queue()
+        self.playback_buffer = defaultdict(bytes)
+        self.playback_sequence = 0
+        self.playback_event = asyncio.Event()
+        self.audio_sequence = 0
         self.playback_task = asyncio.create_task(self.audio_playback_handler())
 
-        # Add a lock for reconnecting to prevent race conditions
+        # Reconnection
         self.is_reconnecting = False
         self.reconnect_lock = asyncio.Lock()
 
-        # Initialize subtitle variables
-        self.subtitle_entries = []  # List to store subtitle entries
-        self.subtitle_index = 1  # Subtitle entry index
+        # Subtitles
+        self.subtitle_entries = []
+        self.subtitle_index = 1
         self.current_subtitle = ""
         self.subtitle_start_time = None
-        self.subtitle_file = open('output/subtitles/subtitles.srt', 'w', encoding='utf-8')
 
-        # Initialize the send queue
-        self.send_queue = Queue()
+        # Send queue
+        self.send_queue = asyncio.Queue()
         self.send_task = asyncio.create_task(self.send_messages())
 
+        # FFmpeg process
         self.ffmpeg_process = None
         self.video_start_time = None
 
-    def create_named_pipe(self, pipe_name):
-        if not os.path.exists(pipe_name):
-            os.mkfifo(pipe_name)
-            self.logger.info(f"Created named pipe: {pipe_name}")
-        else:
-            self.logger.info(f"Named pipe already exists: {pipe_name}")
+        # Audio Saver
+        self.audio_saver = AudioSaver(output_wav_path='output/audio/output/translated_audio.wav')
+        self.verify_audio_task = asyncio.create_task(self.verify_audio_writing())
+
+    def create_named_pipes(self):
+        """Create named pipes if they don't exist"""
+        for pipe in [self.input_audio_pipe, self.translated_audio_pipe]:
+            try:
+                if not os.path.exists(pipe):
+                    os.mkfifo(pipe)
+                    self.logger.info(f"Created named pipe: {pipe}")
+                else:
+                    self.logger.info(f"Named pipe already exists: {pipe}")
+            except Exception as e:
+                self.logger.error(f"Error creating pipe {pipe}: {e}")
+                raise
+
+    def initialize_subtitles(self):
+        """Initialize the subtitles file with a placeholder to prevent FFmpeg from blocking"""
+        if not os.path.exists(self.subtitle_file_path) or os.path.getsize(self.subtitle_file_path) == 0:
+            with open(self.subtitle_file_path, 'w', encoding='utf-8') as f:
+                placeholder_subtitle = srt.Subtitle(
+                    index=0,
+                    start=datetime.timedelta(0),
+                    end=datetime.timedelta(seconds=1),
+                    content=" "
+                )
+                f.write(srt.compose([placeholder_subtitle]))
+            self.logger.info("Initialized subtitles file with a placeholder.")
+
+        # Open the subtitles file in read-plus mode
+        self.subtitle_file = open(self.subtitle_file_path, 'r+', encoding='utf-8')
 
     async def send_messages(self):
         """Dedicated coroutine to send messages from the send_queue."""
@@ -105,11 +129,10 @@ class OpenAIClient:
         self.logger.info("Starting to read from input_audio_pipe")
         while True:
             try:
-                async with aiofiles.open('input_audio_pipe', 'rb') as pipe:
+                async with aiofiles.open(self.input_audio_pipe, 'rb') as pipe:
                     while True:
                         data = await pipe.read(32768)  # Read 32KB
                         if not data:
-                            print('No audio data available')
                             await asyncio.sleep(0.1)
                             continue
                         base64_audio = base64.b64encode(data).decode('utf-8')
@@ -122,7 +145,7 @@ class OpenAIClient:
                         await asyncio.sleep(0.1)  # Prevent flooding
             except Exception as e:
                 self.logger.error(f"Error in read_input_audio: {e}", exc_info=True)
-                continue  # Keep reading audio data
+                await asyncio.sleep(1)  # Prevent tight loop on error
 
     async def audio_playback_handler(self):
         """Handle ordered playback of translated audio chunks from playback_queue"""
@@ -275,73 +298,78 @@ class OpenAIClient:
         """Handle translation responses from OpenAI"""
         while True:
             try:
-                try:
-                    response = await self.ws.recv()
-                except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
-                    self.logger.error(f"WebSocket connection closed during recv: {e}")
-                    await self.reconnect()
-                    continue
-                except Exception as e:
-                    self.logger.error(f"Exception during WebSocket recv: {e}", exc_info=True)
-                    await self.reconnect()
-                    continue
-
-                event = json.loads(response)
-                event_type = event.get("type")
-
-                self.logger.debug(f"Received event: {pprint.pformat(event)}")
-
-                if event_type == "input_audio_buffer.speech_started":
-                    self.logger.info("Speech started")
-                    self.subtitle_start_time = datetime.datetime.now()
-                elif event_type == "input_audio_buffer.speech_stopped":
-                    self.logger.info("Speech stopped")
-                    if self.current_subtitle.strip():
-                        self.write_subtitle(
-                            self.subtitle_index,
-                            self.subtitle_start_time,
-                            datetime.datetime.now(),
-                            self.current_subtitle.strip()
-                        )
-                        self.subtitle_index += 1
-                        self.current_subtitle = ""
-                        self.subtitle_start_time = None
-                    # Commit the audio buffer and create a response
-                    await self.commit_audio_buffer()
-                    await self.create_response()
-                elif event_type == "response.audio.delta":
-                    self.logger.info("Received audio delta")
-                    audio_data = event.get("delta", "")
-                    if audio_data:
-                        try:
-                            decoded_audio = base64.b64decode(audio_data)
-                            sequence = self.audio_sequence  # Assign current sequence number
-                            await self.enqueue_audio(sequence, decoded_audio)
-                            self.audio_sequence += 1  # Increment for the next chunk
-                            self.logger.debug(f"Processed translated audio chunk: {sequence}")
-                        except Exception as e:
-                            self.logger.error(f"Error handling audio data: {e}")
-                elif event_type == "response.audio_transcript.delta":
-                    text = event.get("delta", "")
-                    if text.strip():
-                        self.logger.info(f"Translated text: {text}")
-                        await self.broadcast_translation(text)
-                        # Accumulate subtitle text
-                        self.current_subtitle += text
-                elif event_type == "error":
-                    error_info = event.get("error", {})
-                    self.logger.error(f"OpenAI Error: {error_info}")
+                response = await self.ws.recv()
+            except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
+                self.logger.error(f"WebSocket connection closed during recv: {e}")
+                await self.reconnect()
+                continue
             except Exception as e:
-                self.logger.error(f"Error in handle_responses: {e}", exc_info=True)
+                self.logger.error(f"Exception during WebSocket recv: {e}", exc_info=True)
                 await self.reconnect()
                 continue
 
+            try:
+                event = json.loads(response)
+            except json.JSONDecodeError as e:
+                self.logger.error(f"Failed to decode JSON response: {e}")
+                continue
+
+            event_type = event.get("type")
+
+            self.logger.debug(f"Received event type: {event_type}")
+
+            if event_type == "input_audio_buffer.speech_started":
+                self.logger.info("Speech started")
+                self.subtitle_start_time = datetime.datetime.now()
+            elif event_type == "input_audio_buffer.speech_stopped":
+                self.logger.info("Speech stopped")
+                if self.current_subtitle.strip():
+                    self.write_subtitle(
+                        self.subtitle_index,
+                        self.subtitle_start_time,
+                        datetime.datetime.now(),
+                        self.current_subtitle.strip()
+                    )
+                    self.subtitle_index += 1
+                    self.current_subtitle = ""
+                    self.subtitle_start_time = None
+                # Commit the audio buffer and create a response
+                await self.commit_audio_buffer()
+                await self.create_response()
+            elif event_type == "response.audio.delta":
+                self.logger.info("Received audio delta")
+                audio_data = event.get("delta", "")
+                if audio_data:
+                    try:
+                        decoded_audio = base64.b64decode(audio_data)
+                        sequence = self.audio_sequence  # Assign current sequence number
+                        await self.enqueue_audio(sequence, decoded_audio)
+                        self.audio_sequence += 1  # Increment for the next chunk
+                        self.logger.debug(f"Processed translated audio chunk: {sequence}")
+                    except Exception as e:
+                        self.logger.error(f"Error handling audio data: {e}")
+            elif event_type == "response.audio_transcript.delta":
+                text = event.get("delta", "")
+                if text.strip():
+                    self.logger.info(f"Translated text: {text}")
+                    await self.broadcast_translation(text)
+                    # Accumulate subtitle text
+                    self.current_subtitle += text
+            elif event_type == "error":
+                error_info = event.get("error", {})
+                self.logger.error(f"OpenAI Error: {error_info}")
+            else:
+                self.logger.warning(f"Unhandled event type: {event_type}")
+
     def write_subtitle(self, index, start_time, end_time, text):
         """Write a single subtitle entry to the SRT file using the srt library."""
+        # Initialize video_start_time if not already set
+        if self.video_start_time is None:
+            self.video_start_time = start_time
+
         # Adjust start_time and end_time to match video timeline
-        video_start_time = self.video_start_time  # Assuming you set this when video starts
-        start_td = (start_time - video_start_time)
-        end_td = (end_time - video_start_time)
+        start_td = (start_time - self.video_start_time)
+        end_td = (end_time - self.video_start_time)
 
         # Ensure no negative times
         if start_td.total_seconds() < 0:
@@ -352,6 +380,13 @@ class OpenAIClient:
         subtitle = srt.Subtitle(index=index, start=start_td, end=end_td, content=text)
         self.subtitle_entries.append(subtitle)
 
+        # Validate subtitles
+        try:
+            srt.validate(self.subtitle_entries)
+        except ValueError as e:
+            self.logger.error(f"Subtitle validation error: {e}")
+            return
+
         # Write to the SRT file
         self.subtitle_file.seek(0)
         self.subtitle_file.truncate()
@@ -360,10 +395,32 @@ class OpenAIClient:
         self.logger.debug(f"Written subtitle entry {index}")
 
     async def enqueue_audio(self, sequence: int, audio_data: bytes):
-        """Enqueue translated audio data with its sequence number into playback queue"""
+        """Enqueue translated audio data with its sequence number into playback queue and save to file."""
+        # Validate sequence number
+        if sequence != self.audio_sequence:
+            self.logger.error(f"Audio sequence mismatch: expected {self.audio_sequence}, got {sequence}")
+            # Handle out-of-order or missing sequences as needed
+            # For now, let's skip this chunk
+            return
+
         await self.playback_queue.put((sequence, audio_data))
         self.logger.debug(f"Enqueued audio chunk: {sequence} into playback queue")
         self.playback_event.set()
+
+        # Save the audio data to a separate PCM file for verification
+        audio_output_path = f'output/audio/output/translated_audio_{sequence}.pcm'
+        try:
+            async with aiofiles.open(audio_output_path, 'wb') as f:
+                await f.write(audio_data)
+            self.logger.debug(f"Saved translated audio chunk {sequence} to {audio_output_path}")
+        except Exception as e:
+            self.logger.error(f"Error saving translated audio chunk {sequence}: {e}")
+
+        # Save the audio data to WAV for verification
+        try:
+            await self.audio_saver.save_audio_chunk(audio_data)
+        except Exception as e:
+            self.logger.error(f"Error saving audio to WAV: {e}")
 
     async def heartbeat(self):
         """Send periodic heartbeat pings to keep the WebSocket connection alive."""
@@ -423,10 +480,14 @@ class OpenAIClient:
             if self.playback_queue:
                 await self.playback_queue.put(None)
             if self.playback_task:
-                await self.playback_task
+                self.playback_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self.playback_task
             if self.send_task:
                 await self.send_queue.put(None)
-                await self.send_task
+                self.send_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self.send_task
 
             # Close subtitle file
             if self.subtitle_file:
@@ -441,76 +502,139 @@ class OpenAIClient:
                 self.ffmpeg_process.terminate()
                 self.logger.info("Terminated FFmpeg process")
 
-    def start_ffmpeg_process(self):
-        """Start FFmpeg process to combine streams"""
-        # Build FFmpeg command
+            # Terminate verification task
+            if hasattr(self, 'verify_audio_task'):
+                self.verify_audio_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self.verify_audio_task
+
+            # Shutdown AudioSaver
+            if hasattr(self, 'audio_saver'):
+                await self.audio_saver.shutdown()
+
+    async def start_ffmpeg_process(self):
+        """Start FFmpeg process to combine streams with subtitles overlayed."""
+        # Ensure the subtitles file exists and has at least one entry
+        if not os.path.exists(self.subtitle_file_path) or os.path.getsize(self.subtitle_file_path) == 0:
+            with open(self.subtitle_file_path, 'w', encoding='utf-8') as f:
+                placeholder_subtitle = srt.Subtitle(
+                    index=0,
+                    start=datetime.timedelta(0),
+                    end=datetime.timedelta(seconds=1),
+                    content=" "
+                )
+                f.write(srt.compose([placeholder_subtitle]))
+            self.logger.info("Initialized subtitles file with a placeholder.")
+
+        # Build FFmpeg command with subtitles overlay
         ffmpeg_command = [
             'ffmpeg',
+            '-y',  # Overwrite output file if it exists
             '-re',  # Read input at native frame rate
-            '-itsoffset', '2',  # Delay video by 2 seconds (adjust as needed)
             '-i', self.stream_url,  # Input video stream
             '-f', 's16le',
             '-ar', '24000',
             '-ac', '1',
             '-i', self.translated_audio_pipe,  # Input translated audio from named pipe
-            '-i', 'output/subtitles/subtitles.srt',  # Input subtitles
-            '-c:v', 'copy',
-            '-c:a', 'aac',
+            '-vf', f"subtitles={self.subtitle_file_path}:force_style='FontSize=24,PrimaryColour=&HFFFFFF&'",  # Overlay subtitles with styling
+            '-c:v', 'libx264',  # Encode video using H.264
+            '-c:a', 'aac',        # Encode audio using AAC
             '-b:a', '192k',
-            '-c:s', 'mov_text',
-            '-map', '0:v:0',  # Map video stream
-            '-map', '1:a:0',  # Map audio stream
-            '-map', '2:s:0',  # Map subtitle stream
-            '-f', 'flv',  # Output format
-            self.output_rtmp_url  # Output URL
+            '-preset', 'fast',    # Encoding speed
+            '-pix_fmt', 'yuv420p',# Pixel format
+            self.output_video_file  # Output to local file
         ]
 
         # Start FFmpeg process
-        self.ffmpeg_process = subprocess.Popen(
-            ffmpeg_command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-
-        self.logger.info("Started FFmpeg process to combine streams")
-        self.video_start_time = datetime.datetime.now()
+        try:
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True  # To read stderr as text
+            )
+            self.logger.info("Started FFmpeg process to combine streams with subtitles overlayed")
+            self.video_start_time = datetime.datetime.now()
+        except Exception as e:
+            self.logger.error(f"Failed to start FFmpeg process: {e}", exc_info=True)
+            self.ffmpeg_process = None
 
     async def monitor_ffmpeg(self):
         """Monitor FFmpeg process for errors."""
+        if not self.ffmpeg_process:
+            self.logger.error("FFmpeg process is not running. Cannot monitor.")
+            return
+
         try:
             while True:
                 if self.ffmpeg_process.stderr:
                     line = await asyncio.to_thread(self.ffmpeg_process.stderr.readline)
                     if not line:
                         break
-                    self.logger.error(f"FFmpeg: {line.decode().strip()}")
+                    line = line.strip()
+                    if line:
+                        self.logger.error(f"FFmpeg: {line}")
                 else:
                     await asyncio.sleep(1)
         except Exception as e:
             self.logger.error(f"Error monitoring FFmpeg process: {e}", exc_info=True)
 
+    async def verify_audio_writing(self):
+        """Coroutine to verify that audio data is being written to the pipe."""
+        while True:
+            try:
+                if os.path.exists(self.translated_audio_pipe):
+                    pipe_size = os.stat(self.translated_audio_pipe).st_size
+                    self.logger.debug(f"Translated audio pipe size: {pipe_size} bytes")
+                else:
+                    self.logger.warning(f"Translated audio pipe {self.translated_audio_pipe} does not exist.")
+            except Exception as e:
+                self.logger.error(f"Error verifying translated_audio_pipe: {e}")
+            await asyncio.sleep(10)  # Adjust the interval as needed
+
     async def run(self):
+        """Main loop to run the OpenAIClient."""
         while True:
             try:
                 await self.connect()
-                self.start_ffmpeg_process()
-                # Start monitoring FFmpeg
-                monitor_ffmpeg_task = asyncio.create_task(self.monitor_ffmpeg())
+
                 # Start handling responses
                 handle_responses_task = asyncio.create_task(self.handle_responses())
+
                 # Start reading and sending audio
                 read_input_audio_task = asyncio.create_task(self.read_input_audio())
+
                 # Start heartbeat
                 heartbeat_task = asyncio.create_task(self.heartbeat())
+
+                # Start FFmpeg process after a short delay to ensure pipes and files are ready
+                await asyncio.sleep(2)
+                await self.start_ffmpeg_process()
+
+                # Start monitoring FFmpeg
+                if self.ffmpeg_process:
+                    monitor_ffmpeg_task = asyncio.create_task(self.monitor_ffmpeg())
+                else:
+                    self.logger.error("FFmpeg process was not started. Skipping FFmpeg monitoring.")
+                    monitor_ffmpeg_task = None
+
                 # Wait for tasks to complete
-                await asyncio.gather(
-                    handle_responses_task,
-                    read_input_audio_task,
-                    heartbeat_task,
-                    monitor_ffmpeg_task,
-                    return_exceptions=True
-                )
+                if monitor_ffmpeg_task:
+                    await asyncio.gather(
+                        handle_responses_task,
+                        read_input_audio_task,
+                        heartbeat_task,
+                        monitor_ffmpeg_task,
+                        return_exceptions=True
+                    )
+                else:
+                    await asyncio.gather(
+                        handle_responses_task,
+                        read_input_audio_task,
+                        heartbeat_task,
+                        return_exceptions=True
+                    )
             except Exception as e:
                 self.logger.error(f"Error in OpenAIClient run: {e}", exc_info=True)
                 await self.disconnect(shutdown=False)
