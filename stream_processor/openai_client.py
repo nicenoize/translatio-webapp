@@ -17,7 +17,6 @@ import errno
 from contextlib import suppress
 from pyAudioAnalysis import audioBasicIO
 from pyAudioAnalysis import ShortTermFeatures
-import subprocess
 
 class OpenAIClient:
     def __init__(self, api_key: str, translated_audio_pipe: str):
@@ -75,7 +74,7 @@ class OpenAIClient:
         self.is_reconnecting = False
         self.reconnect_lock = asyncio.Lock()
 
-        # Initialize WAV file for output
+        # Initialize WAV file for output (for verification)
         try:
             self.output_wav = wave.open('output/audio/output_audio.wav', 'wb')
             self.output_wav.setnchannels(1)
@@ -96,9 +95,6 @@ class OpenAIClient:
         # Initialize the send queue
         self.send_queue = Queue()
         self.send_task = asyncio.create_task(self.send_messages())
-
-        # Initialize FFmpeg process
-        self.ffmpeg_process = None  # Will be set when FFmpeg is started
 
         # Initialize video start time
         self.video_start_time = None
@@ -122,6 +118,9 @@ class OpenAIClient:
         self.total_frames = 0  # Total number of audio frames processed
 
     def create_named_pipe(self, pipe_name):
+        """
+        Creates a named pipe if it doesn't already exist.
+        """
         if not os.path.exists(pipe_name):
             os.mkfifo(pipe_name)
             self.logger.info(f"Created named pipe: {pipe_name}")
@@ -259,7 +258,7 @@ class OpenAIClient:
                 continue
 
     async def process_playback_chunk(self, sequence: int, audio_data: bytes):
-        """Process and play a single translated audio chunk for playback and save to WAV"""
+        """Process and play a single translated audio chunk for playback and save to translated_audio_pipe"""
         try:
             if not self.output_wav:
                 self.logger.warning(f"Output WAV file is not open. Skipping audio chunk {sequence}.")
@@ -280,12 +279,12 @@ class OpenAIClient:
             await asyncio.to_thread(play_obj.wait_done)  # Wait until playback is finished
             self.logger.debug(f"Played translated audio chunk: {sequence}")
 
-            # Write the audio data to the translated audio pipe
+            # Write the translated audio data to the translated_audio_pipe for FFmpeg
             try:
                 fd = os.open(self.translated_audio_pipe, os.O_WRONLY | os.O_NONBLOCK)
                 os.write(fd, audio_data)
                 os.close(fd)
-                self.logger.debug(f"Wrote translated audio chunk {sequence} to pipe")
+                self.logger.debug(f"Wrote translated audio chunk {sequence} to translated_audio_pipe")
             except BlockingIOError:
                 # No reader is connected; skip writing
                 self.logger.warning(f"No reader connected to translated_audio_pipe, skipping write.")
@@ -299,11 +298,11 @@ class OpenAIClient:
                 self.logger.error(f"Error writing to translated_audio_pipe: {e}")
 
             # Save a sample audio data for verification
-            sample_path = f'output/audio/output/sample_audio_{sequence}.pcm'
+            sample_path = f'output/audio/output/translated_audio_{sequence}.pcm'
             try:
                 async with aiofiles.open(sample_path, 'wb') as f:
                     await f.write(audio_data)
-                self.logger.debug(f"Saved sample audio chunk {sequence} to {sample_path}")
+                self.logger.debug(f"Saved translated audio chunk {sequence} to {sample_path}")
             except Exception as e:
                 self.logger.error(f"Error saving translated audio chunk {sequence}: {e}")
 
@@ -473,9 +472,7 @@ class OpenAIClient:
                     # Introduce a small delay to ensure all data is written
                     await asyncio.sleep(0.5)  # 500 milliseconds
 
-                    # Start FFmpeg process after speech stopped and data is written
-                    await self.start_ffmpeg_process()
-                    self.logger.info("FFmpeg video creation initiated after speech stopped.")
+                    # Removed call to start_ffmpeg_process
 
                 elif event_type == "response.audio.delta":
                     self.logger.info("Received audio delta")
@@ -641,15 +638,10 @@ class OpenAIClient:
                 except Exception as e:
                     self.logger.error(f"Error closing output WAV file: {e}")
 
-            # Terminate FFmpeg process if it were running
-            if self.ffmpeg_process:
-                try:
-                    self.ffmpeg_process.terminate()
-                    self.logger.info("Terminated FFmpeg process")
-                except Exception as e:
-                    self.logger.error(f"Error terminating FFmpeg process: {e}")
+            # Note: Removed termination of FFmpeg processes as they are handled externally
 
     async def run(self):
+        """Run the OpenAIClient."""
         while True:
             try:
                 await self.connect()
@@ -659,9 +651,6 @@ class OpenAIClient:
                 read_input_audio_task = asyncio.create_task(self.read_input_audio())
                 # Start heartbeat
                 heartbeat_task = asyncio.create_task(self.heartbeat())
-                # Start FFmpeg process after a short delay to ensure pipes and files are ready
-                await asyncio.sleep(2)
-                # FFmpeg is started after speech stops
                 # Wait for tasks to complete
                 await asyncio.gather(
                     handle_responses_task,
@@ -676,60 +665,6 @@ class OpenAIClient:
                 await asyncio.sleep(5)
                 continue  # Restart the loop to reconnect and restart tasks
 
-    async def start_ffmpeg_process(self):
-        """Start the FFmpeg process to create video with subtitles."""
-        if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
-            self.logger.warning("FFmpeg process is already running.")
-            return
-        try:
-            # Get absolute paths
-            audio_path = os.path.abspath('output/audio/output_audio.wav')
-            subtitle_path = os.path.abspath('output/subtitles/subtitles.srt')
-            video_output_path = os.path.abspath('output/video/output_video.mp4')
-
-            # Verify that input files exist
-            if not os.path.isfile(audio_path):
-                self.logger.error(f"Audio file not found: {audio_path}")
-                return
-            if not os.path.isfile(subtitle_path):
-                self.logger.error(f"Subtitle file not found: {subtitle_path}")
-                return
-
-            # Define FFmpeg command
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-y',  # Overwrite output files without asking
-                '-f', 'lavfi',  # Use libavfilter
-                '-i', 'color=c=black:s=1280x720:d=10',  # Black video of 10 seconds
-                '-f', 's16le',  # PCM signed 16-bit little-endian
-                '-ar', '24000',  # Sampling rate
-                '-ac', '1',  # Mono audio
-                '-i', audio_path,  # Input audio file
-                '-vf', f"subtitles={subtitle_path}",  # Subtitles
-                '-c:v', 'libx264',  # Video codec
-                '-c:a', 'aac',  # Audio codec
-                '-b:a', '192k',  # Audio bitrate
-                '-shortest',  # Finish encoding when the shortest input ends
-                video_output_path  # Output video file
-            ]
-
-            self.logger.info(f"Starting FFmpeg with command: {' '.join(ffmpeg_cmd)}")
-            self.ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            self.logger.info("FFmpeg process started.")
-
-            # Start monitoring FFmpeg's stderr
-            asyncio.create_task(self.monitor_ffmpeg())
-        except Exception as e:
-            self.logger.error(f"Failed to start FFmpeg process: {e}", exc_info=True)
-
-    async def monitor_ffmpeg(self):
-        """Monitor FFmpeg process and log output."""
-        if self.ffmpeg_process:
-            try:
-                while True:
-                    line = await asyncio.to_thread(self.ffmpeg_process.stderr.readline)
-                    if not line:
-                        break
-                    self.logger.debug(f"FFmpeg stderr: {line.decode('utf-8').strip()}")
-            except Exception as e:
-                self.logger.error(f"Error monitoring FFmpeg process: {e}", exc_info=True)
+    # Removed internal FFmpeg process management methods:
+    # - start_ffmpeg_process
+    # - monitor_ffmpeg
