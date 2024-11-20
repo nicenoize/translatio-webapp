@@ -14,6 +14,7 @@ from asyncio import Queue
 from collections import defaultdict
 import datetime
 import srt
+import errno
 
 class OpenAIClient:
     def __init__(self, api_key: str, translated_audio_pipe: str):
@@ -90,7 +91,7 @@ class OpenAIClient:
 
             try:
                 await self.safe_send(message)
-                self.logger.debug(f"Sent message: {message}")
+                # self.logger.debug(f"Sent message: {message}")
             except Exception as e:
                 self.logger.error(f"Failed to send message: {e}")
                 # Optionally, re-enqueue the message for retry
@@ -106,26 +107,28 @@ class OpenAIClient:
     async def read_input_audio(self):
         """Coroutine to read audio from input_audio_pipe and send to Realtime API"""
         self.logger.info("Starting to read from input_audio_pipe")
-        try:
-            async with aiofiles.open('input_audio_pipe', 'rb') as pipe:
-                while True:
-                    data = await pipe.read(32768)  # Read 32KB
-                    if not data:
-                        await asyncio.sleep(0.1)
-                        continue
-                    base64_audio = base64.b64encode(data).decode('utf-8')
-                    append_event = {
-                        "type": "input_audio_buffer.append",
-                        "audio": base64_audio
-                    }
-                    await self.enqueue_message(json.dumps(append_event))
-                    self.logger.info(f"Enqueued audio chunk of size: {len(base64_audio)} bytes")
-                    await asyncio.sleep(0.1)  # Prevent flooding
-        except Exception as e:
-            self.logger.error(f"Error in read_input_audio: {e}", exc_info=True)
-            await asyncio.sleep(1)
-            # Continue the loop to keep reading audio data
-            pass
+        while True:
+            try:
+                async with aiofiles.open('input_audio_pipe', 'rb') as pipe:
+                    while True:
+                        data = await pipe.read(32768)  # Read 32KB
+                        if not data:
+                            print('No audio data available')
+                            await asyncio.sleep(0.1)
+                            continue
+                        base64_audio = base64.b64encode(data).decode('utf-8')
+                        append_event = {
+                            "type": "input_audio_buffer.append",
+                            "audio": base64_audio
+                        }
+                        await self.enqueue_message(json.dumps(append_event))
+                        self.logger.info(f"Enqueued audio chunk of size: {len(base64_audio)} bytes")
+                        await asyncio.sleep(0.1)  # Prevent flooding
+            except Exception as e:
+                self.logger.error(f"Error in read_input_audio: {e}", exc_info=True)
+                # Continue the loop to keep reading audio data
+                continue
+
 
     async def audio_playback_handler(self):
         """Handle ordered playback of translated audio chunks from playback_queue"""
@@ -136,7 +139,7 @@ class OpenAIClient:
                     item = await self.playback_queue.get()
                     if item is None:
                         self.logger.info("Playback handler received shutdown signal.")
-                        continue  # Decide whether to exit or continue
+                        continue
                     sequence, audio_data = item
                     if sequence == self.playback_sequence:
                         await self.process_playback_chunk(sequence, audio_data)
@@ -160,6 +163,7 @@ class OpenAIClient:
                 await asyncio.sleep(1)
                 continue
 
+
     async def process_playback_chunk(self, sequence: int, audio_data: bytes):
         """Process and play a single translated audio chunk for playback and save to WAV"""
         # Write to the output WAV file
@@ -173,15 +177,25 @@ class OpenAIClient:
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
             # Create a WaveObject and play
             play_obj = sa.play_buffer(audio_array, 1, 2, 24000)
-            play_obj.wait_done()  # Wait until playback is finished
+            await asyncio.to_thread(play_obj.wait_done)  # Wait until playback is finished
             self.logger.debug(f"Played translated audio chunk: {sequence}")
         except Exception as e:
             self.logger.error(f"Error playing translated audio chunk {sequence}: {e}")
 
-        # Write the audio data to the translated audio pipe for FFmpeg
+        # Write the audio data to the translated audio pipe
         try:
-            with open(self.translated_audio_pipe, 'ab') as pipe:
-                pipe.write(audio_data)
+            fd = os.open(self.translated_audio_pipe, os.O_WRONLY | os.O_NONBLOCK)
+            os.write(fd, audio_data)
+            os.close(fd)
+        except BlockingIOError:
+            # No reader is connected; skip writing
+            self.logger.warning(f"No reader connected to translated_audio_pipe, skipping write.")
+        except OSError as e:
+            if e.errno == errno.ENXIO:
+                # No reader connected
+                self.logger.warning(f"No reader connected to translated_audio_pipe, skipping write.")
+            else:
+                self.logger.error(f"Error writing to translated_audio_pipe: {e}")
         except Exception as e:
             self.logger.error(f"Error writing to translated_audio_pipe: {e}")
 
@@ -203,7 +217,7 @@ class OpenAIClient:
         session_update = {
             "type": "session.update",
             "session": {
-                "object": "realtime.session",
+                # "object": "realtime.session",
                 "model": "gpt-4o-realtime-preview-2024-10-01",
                 "modalities": ["text", "audio"],
                 "instructions": "You are a realtime translator. Please use the audio you receive and translate it into German. Try to match the tone, emotion, and duration of the original audio.",
@@ -274,7 +288,7 @@ class OpenAIClient:
             "type": "response.create",
             "response": {
                 "modalities": ["text", "audio"],
-                "instructions": "Please assist the user with the translation."
+                "instructions": "Please translate the audio you receive into german. Try to keep the original tone and emotion."
             }
         }
         await self.enqueue_message(json.dumps(response_create_event))
@@ -465,7 +479,12 @@ class OpenAIClient:
                 # Start heartbeat
                 heartbeat_task = asyncio.create_task(self.heartbeat())
                 # Wait for tasks to complete
-                await asyncio.gather(handle_responses_task, read_input_audio_task, heartbeat_task)
+                await asyncio.gather(
+                    handle_responses_task,
+                    read_input_audio_task,
+                    heartbeat_task,
+                    return_exceptions=True
+                )
             except Exception as e:
                 self.logger.error(f"Error in OpenAIClient run: {e}", exc_info=True)
                 await self.disconnect(shutdown=False)
