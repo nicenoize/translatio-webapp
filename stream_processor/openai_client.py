@@ -35,6 +35,20 @@ class OpenAIClient:
         self.logger.info("Logging is configured.")
 
         self.translated_audio_pipe = translated_audio_pipe
+
+        # Open translated_audio_pipe for writing early
+        try:
+            self.translated_audio_fd = os.open(self.translated_audio_pipe, os.O_WRONLY | os.O_NONBLOCK)
+            self.logger.info(f"Opened translated_audio_pipe for writing: {self.translated_audio_pipe}")
+        except OSError as e:
+            if e.errno == errno.ENXIO:
+                self.logger.warning(f"No reader available for {self.translated_audio_pipe} yet.")
+                self.translated_audio_fd = None
+            else:
+                self.logger.error(f"Error opening {self.translated_audio_pipe}: {e}")
+                self.translated_audio_fd = None
+
+
         self.websocket_clients: Dict[int, websockets.WebSocketServerProtocol] = {}
         self.rtmp_link = 'rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live'
         self.stream_url = 'https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t'
@@ -111,7 +125,7 @@ class OpenAIClient:
         # To keep track of the current voice for each gender
         self.current_voice = {
             'male': 0,
-            'female': 0
+            'female': 1
         }
 
         # Initialize total frames
@@ -258,7 +272,7 @@ class OpenAIClient:
                 continue
 
     async def process_playback_chunk(self, sequence: int, audio_data: bytes):
-        """Process and play a single translated audio chunk for playback and save to translated_audio_pipe"""
+        """Process and play a single translated audio chunk for playback and save to WAV"""
         try:
             if not self.output_wav:
                 self.logger.warning(f"Output WAV file is not open. Skipping audio chunk {sequence}.")
@@ -279,34 +293,29 @@ class OpenAIClient:
             await asyncio.to_thread(play_obj.wait_done)  # Wait until playback is finished
             self.logger.debug(f"Played translated audio chunk: {sequence}")
 
-            # Write the translated audio data to the translated_audio_pipe for FFmpeg
-            try:
-                fd = os.open(self.translated_audio_pipe, os.O_WRONLY | os.O_NONBLOCK)
-                os.write(fd, audio_data)
-                os.close(fd)
-                self.logger.debug(f"Wrote translated audio chunk {sequence} to translated_audio_pipe")
-            except BlockingIOError:
-                # No reader is connected; skip writing
-                self.logger.warning(f"No reader connected to translated_audio_pipe, skipping write.")
-            except OSError as e:
-                if e.errno == errno.ENXIO:
-                    # No reader connected
-                    self.logger.warning(f"No reader connected to translated_audio_pipe, skipping write.")
-                else:
-                    self.logger.error(f"Error writing to translated_audio_pipe: {e}")
-            except Exception as e:
-                self.logger.error(f"Error writing to translated_audio_pipe: {e}")
+            # Write the audio data to the translated audio pipe if it's open
+            if self.translated_audio_fd:
+                try:
+                    os.write(self.translated_audio_fd, audio_data)
+                    self.logger.debug(f"Wrote translated audio chunk {sequence} to pipe")
+                except OSError as e:
+                    if e.errno == errno.EPIPE:
+                        self.logger.warning(f"Pipe closed. Unable to write translated audio chunk {sequence}.")
+                        self.translated_audio_fd = None  # Reset the file descriptor
+                    else:
+                        self.logger.error(f"Error writing to translated_audio_pipe: {e}")
 
             # Save a sample audio data for verification
-            sample_path = f'output/audio/output/translated_audio_{sequence}.pcm'
+            sample_path = f'output/audio/output/sample_audio_{sequence}.pcm'
             try:
                 async with aiofiles.open(sample_path, 'wb') as f:
                     await f.write(audio_data)
-                self.logger.debug(f"Saved translated audio chunk {sequence} to {sample_path}")
+                self.logger.debug(f"Saved sample audio chunk {sequence} to {sample_path}")
             except Exception as e:
                 self.logger.error(f"Error saving translated audio chunk {sequence}: {e}")
 
         except Exception as e:
+            self.logger.error(f"Error processing playback chunk {sequence}: {e}", exc_info=True)
             self.logger.error(f"Error processing playback chunk {sequence}: {e}", exc_info=True)
 
     async def connect(self):
@@ -615,6 +624,14 @@ class OpenAIClient:
             except Exception as e:
                 self.logger.error(f"Error disconnecting from OpenAI: {e}")
             self.ws = None  # Reset the WebSocket connection
+
+        if self.translated_audio_fd:
+            try:
+                os.close(self.translated_audio_fd)
+                self.logger.info(f"Closed translated_audio_pipe: {self.translated_audio_pipe}")
+            except Exception as e:
+                self.logger.error(f"Error closing translated_audio_pipe: {e}")
+            self.translated_audio_fd = None
 
         if shutdown:
             # Shutdown queues

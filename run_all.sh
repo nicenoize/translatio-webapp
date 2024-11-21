@@ -3,9 +3,6 @@
 # Enable strict mode
 set -euo pipefail
 
-# # Start the script in its own process group
-# set -m
-
 # Check if port 8000 is in use and kill the process
 if lsof -i :8000 -t >/dev/null; then
     echo "Port 8000 is in use. Attempting to free it..."
@@ -13,20 +10,30 @@ if lsof -i :8000 -t >/dev/null; then
     echo "Port 8000 has been freed."
 fi
 
+# Define absolute paths based on your project directory
+PROJECT_DIR="/Users/seebo/Documents/Uni/Masterarbeit/repo/translatio-webapp"
 
-# Define named pipes
-INPUT_AUDIO_PIPE="input_audio_pipe"
-TRANSLATED_AUDIO_PIPE="translated_audio_pipe"
-VIDEO_PIPE="video_pipe"
+# Define named pipes with absolute paths
+INPUT_AUDIO_PIPE="$PROJECT_DIR/input_audio_pipe"
+TRANSLATED_AUDIO_PIPE="$PROJECT_DIR/translated_audio_pipe"
+VIDEO_PIPE="$PROJECT_DIR/video_pipe"
 
-# Define log files
-FFMPEG_AUDIO_LOG="output/logs/ffmpeg_audio.log"
-FFMPEG_VIDEO_LOG="output/logs/ffmpeg_video.log"
-FFMPEG_MIXER_LOG="output/logs/ffmpeg_mixer.log"
-PYTHON_LOG="output/logs/python.log"
+# Define log files with absolute paths
+FFMPEG_AUDIO_LOG="$PROJECT_DIR/output/logs/ffmpeg_audio.log"
+FFMPEG_VIDEO_LOG="$PROJECT_DIR/output/logs/ffmpeg_video.log"
+FFMPEG_MIXER_LOG="$PROJECT_DIR/output/logs/ffmpeg_mixer.log"
+PYTHON_LOG="$PROJECT_DIR/output/logs/python.log"
+
+# Define output video path
+OUTPUT_VIDEO="$PROJECT_DIR/output/video/output_video.mp4"
+
+# Define subtitles path
+SUBTITLES_PATH="$PROJECT_DIR/output/subtitles/subtitles.srt"
 
 # Create output directories if they don't exist
-mkdir -p output/logs
+mkdir -p "$PROJECT_DIR/output/logs"
+mkdir -p "$PROJECT_DIR/output/video"
+mkdir -p "$PROJECT_DIR/output/subtitles"
 
 # Function to create named pipe if it doesn't exist
 create_pipe() {
@@ -65,6 +72,24 @@ ffmpeg -y -re -fflags nobuffer -flags low_delay \
 FFMPEG_VIDEO_PID=$!
 echo "Started FFmpeg Video Pipe with PID: $FFMPEG_VIDEO_PID"
 
+# Start the Python Application
+# Assuming your Python script is named `main.py` and is in the project directory
+echo "Starting Python application..."
+python3 "$PROJECT_DIR/main.py" > "$PYTHON_LOG" 2>&1 &
+PYTHON_PID=$!
+echo "Started Python application with PID: $PYTHON_PID"
+
+# Allow some time for the Python application to open the translated_audio_pipe
+sleep 2
+
+# Check if subtitles file exists; wait until it does
+echo "Waiting for subtitles file to be available..."
+while [[ ! -f "$SUBTITLES_PATH" ]]; do
+    echo "Subtitles file not found. Waiting..."
+    sleep 1
+done
+echo "Subtitles file detected: $SUBTITLES_PATH"
+
 # Start FFmpeg Mixer
 ffmpeg -y \
     -f s16le -ar 24000 -ac 1 -i "$INPUT_AUDIO_PIPE" \
@@ -74,7 +99,7 @@ ffmpeg -y \
         [0:a]volume=0.3[a1]; \
         [1:a]volume=1.0[a2]; \
         [a1][a2]amix=inputs=2:duration=first[aout]; \
-        [2:v]subtitles='/Users/seebo/Documents/Uni/Masterarbeit/repo/translatio-webapp/output/subtitles/subtitles.srt'[vout] \
+        [2:v]subtitles='$SUBTITLES_PATH'[vout] \
     " \
     -map "[vout]" \
     -map "[aout]" \
@@ -83,17 +108,10 @@ ffmpeg -y \
     -b:a 192k \
     -ar 24000 \
     -shortest \
-    "output_video.mp4" > "$FFMPEG_MIXER_LOG" 2>&1 &
+    "$OUTPUT_VIDEO" > "$FFMPEG_MIXER_LOG" 2>&1 &
 
 FFMPEG_MIXER_PID=$!
 echo "Started FFmpeg Mixer with PID: $FFMPEG_MIXER_PID"
-
-# Start the Python Application
-# Assuming your Python script is named `main.py` and is in the same directory
-echo "Starting Python application..."
-python3 main.py > "$PYTHON_LOG" 2>&1 &
-PYTHON_PID=$!
-echo "Started Python application with PID: $PYTHON_PID"
 
 # Function to clean up background processes and named pipes
 cleanup() {
