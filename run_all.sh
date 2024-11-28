@@ -24,8 +24,8 @@ FFMPEG_VIDEO_LOG="$PROJECT_DIR/output/logs/ffmpeg_video.log"
 FFMPEG_MIXER_LOG="$PROJECT_DIR/output/logs/ffmpeg_mixer.log"
 PYTHON_LOG="$PROJECT_DIR/output/logs/python.log"
 
-# Define output video path
-OUTPUT_VIDEO="$PROJECT_DIR/output/video/output_video.mp4"
+# Define output video pattern
+OUTPUT_VIDEO_PATTERN="$PROJECT_DIR/output/video/output_video_%03d.mp4"
 
 # Define subtitles path
 SUBTITLES_PATH="$PROJECT_DIR/output/subtitles/subtitles.srt"
@@ -73,33 +73,43 @@ FFMPEG_VIDEO_PID=$!
 echo "Started FFmpeg Video Pipe with PID: $FFMPEG_VIDEO_PID"
 
 # Start the Python Application
-# Assuming your Python script is named `main.py` and is in the project directory
 echo "Starting Python application..."
 python3 "$PROJECT_DIR/main.py" > "$PYTHON_LOG" 2>&1 &
 PYTHON_PID=$!
 echo "Started Python application with PID: $PYTHON_PID"
 
-# Allow some time for the Python application to open the translated_audio_pipe
+# Allow some time for the Python application to initialize
 sleep 2
 
-# Check if subtitles file exists; wait until it does
-echo "Waiting for subtitles file to be available..."
-while [[ ! -f "$SUBTITLES_PATH" ]]; do
-    echo "Subtitles file not found. Waiting..."
-    sleep 1
-done
-echo "Subtitles file detected: $SUBTITLES_PATH"
+# Remove existing subtitles file
+if [[ -f "$SUBTITLES_PATH" ]]; then
+    echo "Removing existing subtitles file: $SUBTITLES_PATH"
+    rm "$SUBTITLES_PATH"
+fi
 
-# Start FFmpeg Mixer
+# # Create an empty subtitles file
+# touch "$SUBTITLES_PATH"
+# echo "Created empty subtitles file: $SUBTITLES_PATH"
+
+# Create a minimal valid subtitles file
+cat << EOF > "$SUBTITLES_PATH"
+1
+00:00:00,000 --> 00:00:00,001
+EOF
+
+echo "Created minimal subtitles file: $SUBTITLES_PATH"
+
+# Start FFmpeg Mixer with segmentation
 ffmpeg -y \
     -f s16le -ar 24000 -ac 1 -i "$INPUT_AUDIO_PIPE" \
     -f s16le -ar 24000 -ac 1 -i "$TRANSLATED_AUDIO_PIPE" \
     -i "$VIDEO_PIPE" \
     -filter_complex "\
-        [0:a]volume=0.3[a1]; \
-        [1:a]volume=1.0[a2]; \
-        [a1][a2]amix=inputs=2:duration=first[aout]; \
-        [2:v]subtitles='$SUBTITLES_PATH'[vout] \
+        [0:a]asetpts=PTS-STARTPTS,volume=0.3[a1]; \
+        [1:a]asetpts=PTS-STARTPTS,volume=1.0[a2]; \
+        [a1][a2]amix=inputs=2:duration=longest[aout]; \
+        [2:v]setpts=PTS-STARTPTS[v]; \
+        [v]subtitles=${SUBTITLES_PATH}[vout] \
     " \
     -map "[vout]" \
     -map "[aout]" \
@@ -107,8 +117,10 @@ ffmpeg -y \
     -c:a aac \
     -b:a 192k \
     -ar 24000 \
-    -shortest \
-    "$OUTPUT_VIDEO" > "$FFMPEG_MIXER_LOG" 2>&1 &
+    -f segment \
+    -segment_time 30 \
+    -reset_timestamps 1 \
+    "$OUTPUT_VIDEO_PATTERN" > "$FFMPEG_MIXER_LOG" 2>&1 &
 
 FFMPEG_MIXER_PID=$!
 echo "Started FFmpeg Mixer with PID: $FFMPEG_MIXER_PID"

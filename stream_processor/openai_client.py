@@ -17,6 +17,7 @@ import errno
 from contextlib import suppress
 from pyAudioAnalysis import audioBasicIO
 from pyAudioAnalysis import ShortTermFeatures
+import time
 
 class OpenAIClient:
     def __init__(self, api_key: str, translated_audio_pipe: str):
@@ -33,20 +34,28 @@ class OpenAIClient:
         )
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.info("Logging is configured.")
+        self.input_audio_timestamps = []
+        self.video_start_time = time.time()
+        self.last_audio_sent_time = time.time()
+        self.last_translated_audio_received_time = None
+        self.processing_delays = []
+        self.average_processing_delay = 0.0
 
         self.translated_audio_pipe = translated_audio_pipe
+        self.translated_audio_fd = None
 
-        # Open translated_audio_pipe for writing early
-        try:
-            self.translated_audio_fd = os.open(self.translated_audio_pipe, os.O_WRONLY | os.O_NONBLOCK)
-            self.logger.info(f"Opened translated_audio_pipe for writing: {self.translated_audio_pipe}")
-        except OSError as e:
-            if e.errno == errno.ENXIO:
-                self.logger.warning(f"No reader available for {self.translated_audio_pipe} yet.")
-                self.translated_audio_fd = None
-            else:
-                self.logger.error(f"Error opening {self.translated_audio_pipe}: {e}")
-                self.translated_audio_fd = None
+        # # Open translated_audio_pipe for writing early
+        # try:
+        #     self.translated_audio_fd = os.open(self.translated_audio_pipe, os.O_WRONLY | os.O_NONBLOCK)
+        #     self.logger.info(f"Opened translated_audio_pipe for writing: {self.translated_audio_pipe}")
+        # except OSError as e:
+        #     if e.errno == errno.ENXIO:
+        #         self.logger.warning(f"No reader available for {self.translated_audio_pipe} yet.")
+        #         self.translated_audio_fd = None
+        #     else:
+        #         self.logger.error(f"Error opening {self.translated_audio_pipe}: {e}")
+        #         self.translated_audio_fd = None
+
 
 
         self.websocket_clients: Dict[int, websockets.WebSocketServerProtocol] = {}
@@ -109,9 +118,6 @@ class OpenAIClient:
         # Initialize the send queue
         self.send_queue = Queue()
         self.send_task = asyncio.create_task(self.send_messages())
-
-        # Initialize video start time
-        self.video_start_time = None
 
         # Initialize latest input audio for gender detection
         self.latest_input_audio = b''
@@ -222,6 +228,11 @@ class OpenAIClient:
                             await asyncio.sleep(0.1)
                             continue
                         self.latest_input_audio = data  # Store for gender detection
+
+                        # Record the timestamp when the audio chunk is read
+                        timestamp = time.time()
+                        self.input_audio_timestamps.append(timestamp)
+
                         base64_audio = base64.b64encode(data).decode('utf-8')
                         append_event = {
                             "type": "input_audio_buffer.append",
@@ -232,39 +243,19 @@ class OpenAIClient:
                         await asyncio.sleep(0.1)  # Prevent flooding
             except Exception as e:
                 self.logger.error(f"Error in read_input_audio: {e}", exc_info=True)
-                # Continue the loop to keep reading audio data
                 await asyncio.sleep(1)  # Prevent tight loop on error
 
+
     async def audio_playback_handler(self):
-        """Handle ordered playback of translated audio chunks from playback_queue"""
         while True:
             try:
                 await self.playback_event.wait()
-                while not self.playback_queue.empty():
-                    item = await self.playback_queue.get()
-                    if item is None:
-                        self.logger.info("Playback handler received shutdown signal.")
-                        continue
-                    sequence, audio_data = item
-                    self.logger.debug(f"Processing audio chunk: {sequence}")
-                    if sequence == self.playback_sequence:
-                        await self.process_playback_chunk(sequence, audio_data)
-                        self.playback_sequence += 1
-                        self.logger.debug(f"Processed audio chunk: {sequence}")
-                        # Check if the next sequences are already in the buffer
-                        while self.playback_sequence in self.playback_buffer:
-                            buffered_data = self.playback_buffer.pop(self.playback_sequence)
-                            self.logger.debug(f"Processing buffered audio chunk: {self.playback_sequence}")
-                            await self.process_playback_chunk(self.playback_sequence, buffered_data)
-                            self.playback_sequence += 1
-                    elif sequence > self.playback_sequence:
-                        # Future chunk, store in buffer
-                        self.playback_buffer[sequence] = audio_data
-                        self.logger.debug(f"Buffered out-of-order playback audio chunk: {sequence}")
-                    else:
-                        # Duplicate or old chunk, ignore
-                        self.logger.warning(f"Ignoring duplicate or old playback audio chunk: {sequence}")
-                    self.playback_queue.task_done()
+                while self.playback_sequence in self.playback_buffer:
+                    audio_data = self.playback_buffer.pop(self.playback_sequence)
+                    self.logger.debug(f"Processing audio chunk: {self.playback_sequence}")
+                    await self.process_playback_chunk(self.playback_sequence, audio_data)
+                    self.playback_sequence += 1
+                    self.logger.debug(f"Processed audio chunk: {self.playback_sequence - 1}")
                 self.playback_event.clear()
             except Exception as e:
                 self.logger.error(f"Error in audio_playback_handler: {e}", exc_info=True)
@@ -294,16 +285,23 @@ class OpenAIClient:
             self.logger.debug(f"Played translated audio chunk: {sequence}")
 
             # Write the audio data to the translated audio pipe if it's open
-            if self.translated_audio_fd:
+            if self.translated_audio_fd is None:
                 try:
-                    os.write(self.translated_audio_fd, audio_data)
-                    self.logger.debug(f"Wrote translated audio chunk {sequence} to pipe")
+                    self.translated_audio_fd = os.open(self.translated_audio_pipe, os.O_WRONLY)
+                    self.logger.info(f"Opened translated_audio_pipe for writing: {self.translated_audio_pipe}")
                 except OSError as e:
-                    if e.errno == errno.EPIPE:
-                        self.logger.warning(f"Pipe closed. Unable to write translated audio chunk {sequence}.")
-                        self.translated_audio_fd = None  # Reset the file descriptor
-                    else:
-                        self.logger.error(f"Error writing to translated_audio_pipe: {e}")
+                    self.logger.error(f"Error opening translated_audio_pipe for writing: {e}")
+                    return  # Exit the function if unable to open the pipe
+
+            try:
+                os.write(self.translated_audio_fd, audio_data)
+                self.logger.debug(f"Wrote translated audio chunk {sequence} to pipe")
+            except OSError as e:
+                if e.errno == errno.EPIPE:
+                    self.logger.warning(f"Pipe closed. Unable to write translated audio chunk {sequence}.")
+                    self.translated_audio_fd = None  # Reset the file descriptor
+                else:
+                    self.logger.error(f"Error writing to translated_audio_pipe: {e}")
 
             # Save a sample audio data for verification
             sample_path = f'output/audio/output/sample_audio_{sequence}.pcm'
@@ -316,7 +314,7 @@ class OpenAIClient:
 
         except Exception as e:
             self.logger.error(f"Error processing playback chunk {sequence}: {e}", exc_info=True)
-            self.logger.error(f"Error processing playback chunk {sequence}: {e}", exc_info=True)
+
 
     async def connect(self):
         """Connect to OpenAI's Realtime API and initialize session"""
@@ -421,53 +419,40 @@ class OpenAIClient:
         """Handle translation responses from OpenAI"""
         while True:
             try:
-                try:
-                    response = await self.ws.recv()
-                except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
-                    self.logger.error(f"WebSocket connection closed during recv: {e}")
-                    await self.reconnect()
-                    continue
-                except Exception as e:
-                    self.logger.error(f"Exception during WebSocket recv: {e}", exc_info=True)
-                    await self.reconnect()
-                    continue
-
+                response = await self.ws.recv()
                 event = json.loads(response)
                 event_type = event.get("type")
 
-                self.logger.debug(f"Received event type: {event_type}")
-
                 if event_type == "input_audio_buffer.speech_started":
                     self.logger.info("Speech started")
-                    self.speech_start_frame = self.total_frames  # Mark the start frame of speech
-                    self.logger.debug(f"Speech started at frame: {self.speech_start_frame}")
-                    # Removed reopening of self.output_wav here to prevent overwriting
+                    self.speech_start_time = time.time()  # Use actual time
+                    self.logger.debug(f"Speech started at time: {self.speech_start_time}")
 
                 elif event_type == "input_audio_buffer.speech_stopped":
                     self.logger.info("Speech stopped")
-                    if self.current_subtitle.strip() and self.speech_start_frame is not None:
+                    speech_end_time = time.time()
+
+                    # Ensure that there is subtitle text and start time before writing
+                    if self.current_subtitle.strip() and self.speech_start_time is not None:
                         self.logger.debug("Current subtitle is not empty, writing subtitle.")
-                        
-                        # Calculate start and end times in seconds
-                        start_sec = self.speech_start_frame / 24000
-                        end_sec = self.total_frames / 24000
 
                         await self.write_subtitle(
                             self.subtitle_index,
-                            start_sec,
-                            end_sec,
+                            self.speech_start_time,
+                            speech_end_time,
                             self.current_subtitle.strip()
                         )
                         self.logger.debug(f"Subtitle written: {self.subtitle_index}")
                         self.subtitle_index += 1
                         self.current_subtitle = ""
-                        self.speech_start_frame = None
+                        self.speech_start_time = None
                     else:
-                        self.logger.debug("Current subtitle is empty or speech_start_frame is None, skipping write_subtitle.")
+                        self.logger.debug("Current subtitle is empty or speech_start_time is None, skipping write_subtitle.")
 
                     # Commit the audio buffer and create a response
                     await self.commit_audio_buffer()
                     self.logger.debug("Audio buffer committed.")
+                    self.last_audio_sent_time = time.time()
 
                     # Detect gender and create response with appropriate voice
                     gender = self.detect_gender(self.latest_input_audio)
@@ -476,17 +461,28 @@ class OpenAIClient:
                     self.logger.debug(f"Selected voice: {selected_voice}")
                     await self.create_response(selected_voice)
 
-                    # Removed closing of self.output_wav to keep it open for writing
-
                     # Introduce a small delay to ensure all data is written
                     await asyncio.sleep(0.5)  # 500 milliseconds
 
-                    # Removed call to start_ffmpeg_process
-
                 elif event_type == "response.audio.delta":
-                    self.logger.info("Received audio delta")
                     audio_data = event.get("delta", "")
                     if audio_data:
+                        self.logger.info("Received audio delta")
+                        self.last_translated_audio_received_time = time.time()
+
+                        # Ensure last_audio_sent_time is set before calculating delay
+                        if self.last_audio_sent_time is not None:
+                            processing_delay = self.last_translated_audio_received_time - self.last_audio_sent_time
+                            self.processing_delays.append(processing_delay)
+                            self.logger.debug(f"Processing delay recorded: {processing_delay} seconds")
+
+                            # Update average processing delay
+                            if self.processing_delays:
+                                self.average_processing_delay = sum(self.processing_delays) / len(self.processing_delays)
+                                self.logger.debug(f"Updated average processing delay: {self.average_processing_delay} seconds")
+                        else:
+                            self.logger.warning("last_audio_sent_time is None. Cannot calculate processing delay.")
+
                         try:
                             decoded_audio = base64.b64decode(audio_data)
                             sequence = self.audio_sequence  # Assign current sequence number
@@ -494,7 +490,8 @@ class OpenAIClient:
                             self.audio_sequence += 1  # Increment for the next chunk
                             self.logger.debug(f"Processed translated audio chunk: {sequence}")
                         except Exception as e:
-                            self.logger.error(f"Error handling audio data: {e}")
+                            self.logger.error(f"Error handling audio data: {e}", exc_info=True)
+
 
                 elif event_type == "response.audio_transcript.delta":
                     text = event.get("delta", "")
@@ -522,12 +519,15 @@ class OpenAIClient:
                 await self.reconnect()
                 continue
 
-    async def write_subtitle(self, index, start_sec, end_sec, text):
+    async def write_subtitle(self, index, start_time, end_time, text):
         """Write a single subtitle entry to the SRT file using the srt library"""
         try:
-            # Convert seconds to timedelta
-            start_td = datetime.timedelta(seconds=start_sec)
-            end_td = datetime.timedelta(seconds=end_sec)
+            # Ensure average_processing_delay is calculated
+            if not self.processing_delays:
+                self.average_processing_delay = 0.0
+
+            start_td = datetime.timedelta(seconds=start_time - self.video_start_time - self.average_processing_delay)
+            end_td = datetime.timedelta(seconds=end_time - self.video_start_time - self.average_processing_delay)
 
             # Debugging: Log the timing details
             self.logger.debug(f"Writing subtitle {index}: Start={start_td}, End={end_td}, Text='{text}'")
@@ -548,20 +548,12 @@ class OpenAIClient:
         except Exception as e:
             self.logger.error(f"Error writing subtitle entry {index}: {e}", exc_info=True)
 
-    async def enqueue_audio(self, sequence: int, audio_data: bytes):
-        """Enqueue translated audio data with its sequence number into playback queue"""
-        # Validate sequence number
-        if sequence != self.audio_sequence:
-            self.logger.error(f"Audio sequence mismatch: expected {self.audio_sequence}, got {sequence}")
-            # Buffer the out-of-order chunk
-            self.playback_buffer[sequence] = audio_data
-            self.logger.debug(f"Buffered out-of-order audio chunk: {sequence}")
-            return
 
-        self.logger.debug(f"Enqueuing audio chunk {sequence}")
-        await self.playback_queue.put((sequence, audio_data))
-        self.logger.debug(f"Enqueued audio chunk: {sequence} into playback queue")
-        self.playback_event.set()
+    async def enqueue_audio(self, sequence: int, audio_data: bytes):
+        """Enqueue translated audio data with its sequence number into playback buffer"""
+
+        self.logger.debug(f"Received audio chunk {sequence}, buffering.")
+        self.playback_buffer[sequence] = audio_data
 
         # Save the audio data to a separate PCM file for verification
         audio_output_path = f'output/audio/output/translated_audio_{sequence}.pcm'
@@ -571,6 +563,9 @@ class OpenAIClient:
             self.logger.debug(f"Saved translated audio chunk {sequence} to {audio_output_path}")
         except Exception as e:
             self.logger.error(f"Error saving translated audio chunk {sequence}: {e}")
+
+        # Signal the playback handler
+        self.playback_event.set()
 
     async def heartbeat(self):
         """Send periodic heartbeat pings to keep the WebSocket connection alive."""
@@ -657,6 +652,8 @@ class OpenAIClient:
 
             # Note: Removed termination of FFmpeg processes as they are handled externally
 
+    
+
     async def run(self):
         """Run the OpenAIClient."""
         while True:
@@ -681,7 +678,3 @@ class OpenAIClient:
                 self.logger.info("Restarting tasks in 5 seconds...")
                 await asyncio.sleep(5)
                 continue  # Restart the loop to reconnect and restart tasks
-
-    # Removed internal FFmpeg process management methods:
-    # - start_ffmpeg_process
-    # - monitor_ffmpeg
