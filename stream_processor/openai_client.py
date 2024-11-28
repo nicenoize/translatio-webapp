@@ -1,5 +1,3 @@
-# stream_processor/openai_client.py
-
 import asyncio
 import aiofiles
 import websockets
@@ -79,11 +77,12 @@ class OpenAIClient:
         # Initialize WAV file for output (for verification)
         try:
             os.makedirs('output/audio/output', exist_ok=True)
-            self.output_wav = wave.open('output/audio/output_audio.wav', 'wb')
+            self.output_wav_path = 'output/audio/output_audio.wav'
+            self.output_wav = wave.open(self.output_wav_path, 'wb')
             self.output_wav.setnchannels(1)
             self.output_wav.setsampwidth(2)  # 16-bit PCM
             self.output_wav.setframerate(24000)
-            self.logger.info("Initialized output WAV file.")
+            self.logger.info(f"Initialized output WAV file at {self.output_wav_path}.")
         except Exception as e:
             self.logger.error(f"Failed to initialize output WAV file: {e}", exc_info=True)
             self.output_wav = None  # Ensure it's set to None on failure
@@ -125,6 +124,10 @@ class OpenAIClient:
         self.segment_index = 1  # To keep track of video segments
         self.segment_start_time = None  # Start time of the current segment
 
+        # Dictionary to store Wave_write objects for each segment
+        self.segment_audio_writers = {}
+        self.segment_audio_lock = asyncio.Lock()
+
         # Create and ensure the existence of output directories
         self.create_directories()
 
@@ -154,6 +157,7 @@ class OpenAIClient:
             'output/subtitles',
             'output/logs',
             'output/video',
+            'output/final',  # New folder for final muxed videos
             'output/images'  # For static image
         ]
         for directory in directories:
@@ -310,16 +314,18 @@ class OpenAIClient:
             self.logger.debug(f"Played translated audio chunk: {sequence}")
 
             # Write to the output WAV file
-            if self.output_wav_path:
-                async with aiofiles.open(self.output_wav_path, 'ab') as wf:
-                    await wf.write(audio_data)
+            if self.output_wav:
+                self.output_wav.writeframes(audio_data)
                 self.logger.debug(f"Written translated audio chunk {sequence} to WAV file")
 
-            # Save translated audio segment corresponding to the video segment
-            audio_segment_path = f'output/audio/output_audio_segment_{self.segment_index}.wav'
-            async with aiofiles.open(audio_segment_path, 'ab') as wf:
-                await wf.write(audio_data)
-            self.logger.info(f"Saved translated audio segment: {audio_segment_path}")
+            # Write to the corresponding per-segment audio WAV file
+            async with self.segment_audio_lock:
+                wf = self.segment_audio_writers.get(self.segment_index)
+                if wf:
+                    wf.writeframes(audio_data)
+                    self.logger.debug(f"Written translated audio chunk {sequence} to segment {self.segment_index} WAV file")
+                else:
+                    self.logger.error(f"No Wave_write object found for segment {self.segment_index}")
 
         except Exception as e:
             self.logger.error(f"Error processing playback chunk {sequence}: {e}", exc_info=True)
@@ -505,6 +511,10 @@ class OpenAIClient:
 
                         try:
                             decoded_audio = base64.b64decode(audio_data)
+                            if len(decoded_audio) == 0:
+                                self.logger.warning(f"Decoded audio data is empty for sequence {self.audio_sequence}")
+                            else:
+                                self.logger.debug(f"Decoded audio data for sequence {self.audio_sequence}: {len(decoded_audio)} bytes")
                             sequence = self.audio_sequence  # Assign current sequence number
                             # Calculate the start time for this audio chunk
                             start_time = time.time()
@@ -513,6 +523,8 @@ class OpenAIClient:
                             self.logger.debug(f"Processed translated audio chunk: {sequence}")
                         except Exception as e:
                             self.logger.error(f"Error handling audio data: {e}", exc_info=True)
+                    else:
+                        self.logger.debug("Received empty audio delta.")
 
                 elif event_type == "response.audio_transcript.delta":
                     text = event.get("delta", "")
@@ -627,6 +639,16 @@ class OpenAIClient:
                 except Exception as e:
                     self.logger.error(f"Error closing output WAV file: {e}")
 
+            # Close all segment Wave_write objects
+            async with self.segment_audio_lock:
+                for segment_index, wf in self.segment_audio_writers.items():
+                    try:
+                        wf.close()
+                        self.logger.debug(f"Closed Wave_write object for segment {segment_index}")
+                    except Exception as e:
+                        self.logger.error(f"Error closing Wave_write object for segment {segment_index}: {e}")
+                self.segment_audio_writers.clear()
+
     async def run(self):
         """Run the OpenAIClient."""
         try:
@@ -709,6 +731,14 @@ class OpenAIClient:
                         wf.setsampwidth(2)  # 16-bit PCM
                         wf.setframerate(24000)
                     self.logger.debug(f"Initialized audio segment file: {audio_segment_path}")
+
+                    # Open the Wave_write object and store it
+                    wf = wave.open(audio_segment_path, 'wb')
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(24000)
+                    self.segment_audio_writers[self.segment_index] = wf
+                    self.logger.debug(f"Stored Wave_write object for segment {self.segment_index}")
                 except Exception as e:
                     self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
 
@@ -783,7 +813,7 @@ class OpenAIClient:
             # Put the text on top of the rectangle
             cv2.putText(frame, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
 
-    async def save_subtitles_to_srt(self, segment_index):
+    async def save_subtitles_to_srt(self, segment_index: int):
         """Save accumulated subtitles to an SRT file for the segment."""
         try:
             if not self.subtitle_data_list:
@@ -812,7 +842,7 @@ class OpenAIClient:
         """Mux video segment with corresponding audio segment using FFmpeg"""
         video_path = f'output/video/output_video_segment_{segment_index}.mp4'
         audio_path = f'output/audio/output_audio_segment_{segment_index}.wav'
-        final_output_path = f'output/video/final_output_video_segment_{segment_index}.mp4'
+        final_output_path = f'output/final/final_output_video_segment_{segment_index}.mp4'
 
         # Check if both video and audio files exist
         if not os.path.exists(video_path):
@@ -844,6 +874,13 @@ class OpenAIClient:
                 self.logger.error(f"FFmpeg stderr: {process.stderr}")
         except Exception as e:
             self.logger.error(f"Error during FFmpeg muxing: {e}", exc_info=True)
+        finally:
+            # Close the corresponding Wave_write object
+            async with self.segment_audio_lock:
+                wf = self.segment_audio_writers.pop(segment_index, None)
+                if wf:
+                    wf.close()
+                    self.logger.debug(f"Closed Wave_write object for segment {segment_index}")
 
     async def register_websocket(self, websocket: websockets.WebSocketServerProtocol) -> int:
         """Register a new WebSocket client and return its unique ID."""
