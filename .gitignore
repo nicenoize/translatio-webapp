@@ -20,3 +20,7 @@ stream_output/subtitles/
 output/audio/
 
 output/debug/audio/
+
+*.srt
+
+*.mp4

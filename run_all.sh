@@ -3,14 +3,7 @@
 # Enable strict mode
 set -euo pipefail
 
-# Check if port 8000 is in use and kill the process
-if lsof -i :8000 -t >/dev/null; then
-    echo "Port 8000 is in use. Attempting to free it..."
-    lsof -i :8000 -t | xargs kill -9
-    echo "Port 8000 has been freed."
-fi
-
-# Define absolute paths based on your project directory
+# Define project directory
 PROJECT_DIR="/Users/seebo/Documents/Uni/Masterarbeit/repo/translatio-webapp"
 
 # Define named pipes with absolute paths
@@ -54,6 +47,13 @@ create_pipe "$VIDEO_PIPE"
 # Ensure pipes have correct permissions
 chmod 666 "$INPUT_AUDIO_PIPE" "$TRANSLATED_AUDIO_PIPE" "$VIDEO_PIPE"
 
+# Check if port 8000 is in use and kill the process
+if lsof -i :8000 -t >/dev/null; then
+    echo "Port 8000 is in use. Attempting to free it..."
+    lsof -i :8000 -t | xargs kill -9
+    echo "Port 8000 has been freed."
+fi
+
 # Start FFmpeg Audio Pipe
 ffmpeg -y -re -fflags nobuffer -flags low_delay \
     -i "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t" \
@@ -87,10 +87,6 @@ if [[ -f "$SUBTITLES_PATH" ]]; then
     rm "$SUBTITLES_PATH"
 fi
 
-# # Create an empty subtitles file
-# touch "$SUBTITLES_PATH"
-# echo "Created empty subtitles file: $SUBTITLES_PATH"
-
 # Create a minimal valid subtitles file
 cat << EOF > "$SUBTITLES_PATH"
 1
@@ -99,7 +95,7 @@ EOF
 
 echo "Created minimal subtitles file: $SUBTITLES_PATH"
 
-# Start FFmpeg Mixer with segmentation
+# Start FFmpeg Mixer with 5-second segmentation
 ffmpeg -y \
     -f s16le -ar 24000 -ac 1 -i "$INPUT_AUDIO_PIPE" \
     -f s16le -ar 24000 -ac 1 -i "$TRANSLATED_AUDIO_PIPE" \
@@ -107,7 +103,7 @@ ffmpeg -y \
     -filter_complex "\
         [0:a]asetpts=PTS-STARTPTS,volume=0.3[a1]; \
         [1:a]asetpts=PTS-STARTPTS,volume=1.0[a2]; \
-        [a1][a2]amix=inputs=2:duration=longest[aout]; \
+        [a1][a2]amix=inputs=2:duration=shortest[aout]; \
         [2:v]setpts=PTS-STARTPTS[v]; \
         [v]subtitles=${SUBTITLES_PATH}[vout] \
     " \
@@ -118,7 +114,7 @@ ffmpeg -y \
     -b:a 192k \
     -ar 24000 \
     -f segment \
-    -segment_time 30 \
+    -segment_time 5 \
     -reset_timestamps 1 \
     "$OUTPUT_VIDEO_PATTERN" > "$FFMPEG_MIXER_LOG" 2>&1 &
 
