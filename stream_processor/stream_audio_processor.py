@@ -12,14 +12,15 @@ class StreamAudioProcessor:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.setup_logging()
 
-        self.input_audio_pipe = 'input_audio_pipe'
-        self.translated_audio_pipe = 'translated_audio_pipe'
+        self.input_audio_pipe = os.path.abspath('input_audio_pipe')
+        # Removed translated_audio_pipe
+        # self.translated_audio_pipe = os.path.abspath('translated_audio_pipe')
         
         # Create named pipes if they don't exist
         self.create_named_pipes()
 
-        # Initialize OpenAIClient
-        self.openai_client = OpenAIClient(api_key=openai_api_key, translated_audio_pipe=self.translated_audio_pipe)
+        # Initialize OpenAIClient without translated_audio_pipe
+        self.openai_client = OpenAIClient(api_key=openai_api_key)
         self.stream_url = stream_url
         self.output_rtmp_url = output_rtmp_url
 
@@ -29,7 +30,7 @@ class StreamAudioProcessor:
 
     def create_named_pipes(self):
         """Create named pipes if they don't exist"""
-        for pipe in [self.input_audio_pipe, self.translated_audio_pipe]:
+        for pipe in [self.input_audio_pipe]:
             try:
                 if os.path.exists(pipe):
                     os.unlink(pipe)
@@ -42,12 +43,13 @@ class StreamAudioProcessor:
                 raise
 
     def setup_logging(self):
+        """Setup logging configuration"""
         logging.basicConfig(
             level=logging.DEBUG,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.StreamHandler(),
-                logging.FileHandler("stream_processor.log")
+                logging.FileHandler("output/logs/stream_audio_processor.log")
             ]
         )
 
@@ -102,5 +104,14 @@ class StreamAudioProcessor:
 
             # Cleanup OpenAIClient
             await self.openai_client.disconnect(shutdown=True)
+
+            # Remove named pipes
+            for pipe in [self.input_audio_pipe]:
+                try:
+                    if os.path.exists(pipe):
+                        os.unlink(pipe)
+                        self.logger.info(f"Removed named pipe: {pipe}")
+                except Exception as e:
+                    self.logger.error(f"Error removing pipe {pipe}: {e}")
 
             self.logger.info("Cleanup complete")

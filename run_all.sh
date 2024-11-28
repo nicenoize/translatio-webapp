@@ -3,32 +3,19 @@
 # Enable strict mode
 set -euo pipefail
 
-# Check if port 8000 is in use and kill the process
-if lsof -i :8000 -t >/dev/null; then
-    echo "Port 8000 is in use. Attempting to free it..."
-    lsof -i :8000 -t | xargs kill -9
-    echo "Port 8000 has been freed."
-fi
-
 # Define absolute paths based on your project directory
 PROJECT_DIR="/Users/seebo/Documents/Uni/Masterarbeit/repo/translatio-webapp"
 
 # Define named pipes with absolute paths
 INPUT_AUDIO_PIPE="$PROJECT_DIR/input_audio_pipe"
-TRANSLATED_AUDIO_PIPE="$PROJECT_DIR/translated_audio_pipe"
-VIDEO_PIPE="$PROJECT_DIR/video_pipe"
+# TRANSLATED_AUDIO_PIPE="$PROJECT_DIR/translated_audio_pipe"  # Not needed
 
 # Define log files with absolute paths
 FFMPEG_AUDIO_LOG="$PROJECT_DIR/output/logs/ffmpeg_audio.log"
-FFMPEG_VIDEO_LOG="$PROJECT_DIR/output/logs/ffmpeg_video.log"
-FFMPEG_MIXER_LOG="$PROJECT_DIR/output/logs/ffmpeg_mixer.log"
 PYTHON_LOG="$PROJECT_DIR/output/logs/python.log"
-
-# Define output video pattern
-OUTPUT_VIDEO_PATTERN="$PROJECT_DIR/output/video/output_video_%03d.mp4"
-
-# Define subtitles path
-SUBTITLES_PATH="$PROJECT_DIR/output/subtitles/subtitles.srt"
+APP_LOG="$PROJECT_DIR/output/logs/app.log"
+STREAM_AUDIO_PROCESSOR_LOG="$PROJECT_DIR/output/logs/stream_audio_processor.log"
+MAIN_LOG="$PROJECT_DIR/output/logs/main.log"
 
 # Create output directories if they don't exist
 mkdir -p "$PROJECT_DIR/output/logs"
@@ -46,13 +33,17 @@ create_pipe() {
     fi
 }
 
-# Create all required pipes
+# Create required pipes
 create_pipe "$INPUT_AUDIO_PIPE"
-create_pipe "$TRANSLATED_AUDIO_PIPE"
-create_pipe "$VIDEO_PIPE"
+# create_pipe "$TRANSLATED_AUDIO_PIPE"  # Not needed
 
 # Ensure pipes have correct permissions
-chmod 666 "$INPUT_AUDIO_PIPE" "$TRANSLATED_AUDIO_PIPE" "$VIDEO_PIPE"
+chmod 666 "$INPUT_AUDIO_PIPE" 
+# chmod 666 "$TRANSLATED_AUDIO_PIPE"  # Not needed
+
+# Clear existing log files to prevent them from becoming too large
+truncate -s 0 "$FFMPEG_AUDIO_LOG" "$PYTHON_LOG" "$APP_LOG" "$STREAM_AUDIO_PROCESSOR_LOG" "$MAIN_LOG"
+echo "Cleared existing log files."
 
 # Start FFmpeg Audio Pipe
 ffmpeg -y -re -fflags nobuffer -flags low_delay \
@@ -63,77 +54,22 @@ ffmpeg -y -re -fflags nobuffer -flags low_delay \
 FFMPEG_AUDIO_PID=$!
 echo "Started FFmpeg Audio Pipe with PID: $FFMPEG_AUDIO_PID"
 
-# Start FFmpeg Video Pipe
-ffmpeg -y -re -fflags nobuffer -flags low_delay \
-    -i "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t" \
-    -an -c:v copy -f mpegts \
-    "$VIDEO_PIPE" > "$FFMPEG_VIDEO_LOG" 2>&1 &
-
-FFMPEG_VIDEO_PID=$!
-echo "Started FFmpeg Video Pipe with PID: $FFMPEG_VIDEO_PID"
-
 # Start the Python Application
 echo "Starting Python application..."
 python3 "$PROJECT_DIR/main.py" > "$PYTHON_LOG" 2>&1 &
 PYTHON_PID=$!
 echo "Started Python application with PID: $PYTHON_PID"
 
-# Allow some time for the Python application to initialize
-sleep 2
-
-# Remove existing subtitles file
-if [[ -f "$SUBTITLES_PATH" ]]; then
-    echo "Removing existing subtitles file: $SUBTITLES_PATH"
-    rm "$SUBTITLES_PATH"
-fi
-
-# # Create an empty subtitles file
-# touch "$SUBTITLES_PATH"
-# echo "Created empty subtitles file: $SUBTITLES_PATH"
-
-# Create a minimal valid subtitles file
-cat << EOF > "$SUBTITLES_PATH"
-1
-00:00:00,000 --> 00:00:00,001
-EOF
-
-echo "Created minimal subtitles file: $SUBTITLES_PATH"
-
-# Start FFmpeg Mixer with segmentation
-ffmpeg -y \
-    -f s16le -ar 24000 -ac 1 -i "$INPUT_AUDIO_PIPE" \
-    -f s16le -ar 24000 -ac 1 -i "$TRANSLATED_AUDIO_PIPE" \
-    -i "$VIDEO_PIPE" \
-    -filter_complex "\
-        [0:a]asetpts=PTS-STARTPTS,volume=0.3[a1]; \
-        [1:a]asetpts=PTS-STARTPTS,volume=1.0[a2]; \
-        [a1][a2]amix=inputs=2:duration=longest[aout]; \
-        [2:v]setpts=PTS-STARTPTS[v]; \
-        [v]subtitles=${SUBTITLES_PATH}[vout] \
-    " \
-    -map "[vout]" \
-    -map "[aout]" \
-    -c:v libx264 \
-    -c:a aac \
-    -b:a 192k \
-    -ar 24000 \
-    -f segment \
-    -segment_time 30 \
-    -reset_timestamps 1 \
-    "$OUTPUT_VIDEO_PATTERN" > "$FFMPEG_MIXER_LOG" 2>&1 &
-
-FFMPEG_MIXER_PID=$!
-echo "Started FFmpeg Mixer with PID: $FFMPEG_MIXER_PID"
-
 # Function to clean up background processes and named pipes
 cleanup() {
     echo "Cleaning up..."
     # Kill all background processes
-    kill "$FFMPEG_AUDIO_PID" "$FFMPEG_VIDEO_PID" "$FFMPEG_MIXER_PID" "$PYTHON_PID" 2>/dev/null || true
+    kill "$FFMPEG_AUDIO_PID" "$PYTHON_PID" 2>/dev/null || true
     # Optionally, wait for them to terminate
-    wait "$FFMPEG_AUDIO_PID" "$FFMPEG_VIDEO_PID" "$FFMPEG_MIXER_PID" "$PYTHON_PID" 2>/dev/null || true
+    wait "$FFMPEG_AUDIO_PID" "$PYTHON_PID" 2>/dev/null || true
     # Remove named pipes
-    rm -f "$INPUT_AUDIO_PIPE" "$TRANSLATED_AUDIO_PIPE" "$VIDEO_PIPE"
+    rm -f "$INPUT_AUDIO_PIPE"
+    # rm -f "$TRANSLATED_AUDIO_PIPE"  # Not needed
     echo "Cleanup complete."
 }
 
@@ -147,14 +83,6 @@ monitor_processes() {
         sleep 5
         if ! ps -p "$FFMPEG_AUDIO_PID" > /dev/null; then
             echo "FFmpeg Audio Pipe (PID: $FFMPEG_AUDIO_PID) has stopped."
-            exit 1
-        fi
-        if ! ps -p "$FFMPEG_VIDEO_PID" > /dev/null; then
-            echo "FFmpeg Video Pipe (PID: $FFMPEG_VIDEO_PID) has stopped."
-            exit 1
-        fi
-        if ! ps -p "$FFMPEG_MIXER_PID" > /dev/null; then
-            echo "FFmpeg Mixer (PID: $FFMPEG_MIXER_PID) has stopped."
             exit 1
         fi
         if ! ps -p "$PYTHON_PID" > /dev/null; then
