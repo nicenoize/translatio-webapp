@@ -27,6 +27,7 @@ SUBTITLES_PATH="$PROJECT_DIR/output/subtitles/subtitles.srt"
 mkdir -p "$PROJECT_DIR/output/logs"
 mkdir -p "$PROJECT_DIR/output/video"
 mkdir -p "$PROJECT_DIR/output/subtitles"
+mkdir -p "$PROJECT_DIR/output/final"  # For final muxed videos
 
 # Function to create named pipe if it doesn't exist
 create_pipe() {

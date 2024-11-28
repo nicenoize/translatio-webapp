@@ -65,11 +65,17 @@ async def startup_event():
     stream_url = "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t"
     output_rtmp_url = "rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live"
 
+    # Configuration Parameters
+    enable_playback = False  # Set to False to disable local playback
+    min_subtitle_duration = 1.0  # Minimum subtitle display duration in seconds
+
     # Initialize StreamAudioProcessor with the updated OpenAIClient
     processor = StreamAudioProcessor(
         openai_api_key=api_key,
         stream_url=stream_url,
-        output_rtmp_url=output_rtmp_url
+        output_rtmp_url=output_rtmp_url,
+        enable_playback=enable_playback,
+        min_subtitle_duration=min_subtitle_duration
     )
     
     # Set up signal handlers

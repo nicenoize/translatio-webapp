@@ -8,38 +8,33 @@ import os
 from contextlib import suppress
 
 class StreamAudioProcessor:
-    def __init__(self, openai_api_key: str, stream_url: str, output_rtmp_url: str):
+    def __init__(self, openai_api_key: str, stream_url: str, output_rtmp_url: str, enable_playback: bool = True, min_subtitle_duration: float = 1.0):
+        """
+        Initialize the StreamAudioProcessor.
+
+        :param openai_api_key: OpenAI API key.
+        :param stream_url: URL of the input stream.
+        :param output_rtmp_url: URL to stream the output via RTMP.
+        :param enable_playback: Flag to enable or disable local audio playback.
+        :param min_subtitle_duration: Minimum duration (in seconds) for each subtitle display.
+        """
         self.logger = logging.getLogger(self.__class__.__name__)
         self.setup_logging()
 
-        self.input_audio_pipe = 'input_audio_pipe'
         self.translated_audio_pipe = 'translated_audio_pipe'
-        
-        # Create named pipes if they don't exist
-        self.create_named_pipes()
-
-        # Initialize OpenAIClient
-        self.openai_client = OpenAIClient(api_key=openai_api_key, translated_audio_pipe=self.translated_audio_pipe)
         self.stream_url = stream_url
         self.output_rtmp_url = output_rtmp_url
 
-        self.tasks = []
+        # Initialize OpenAIClient with the new parameters
+        self.openai_client = OpenAIClient(
+            api_key=openai_api_key,
+            translated_audio_pipe=self.translated_audio_pipe,
+            enable_playback=enable_playback,
+            min_subtitle_duration=min_subtitle_duration
+        )
+
         self.running = True
         self.cleanup_lock = asyncio.Lock()
-
-    def create_named_pipes(self):
-        """Create named pipes if they don't exist"""
-        for pipe in [self.input_audio_pipe, self.translated_audio_pipe]:
-            try:
-                if os.path.exists(pipe):
-                    os.unlink(pipe)
-                os.mkfifo(pipe)
-                self.logger.info(f"Created named pipe: {pipe}")
-            except FileExistsError:
-                self.logger.info(f"Pipe already exists: {pipe}")
-            except Exception as e:
-                self.logger.error(f"Error creating pipe {pipe}: {e}")
-                raise
 
     def setup_logging(self):
         logging.basicConfig(
@@ -72,11 +67,6 @@ class StreamAudioProcessor:
 
             self.logger.info("Starting StreamAudioProcessor...")
 
-            # Ensure that the input_audio_pipe exists
-            if not os.path.exists(self.input_audio_pipe):
-                self.logger.error(f"Named pipe {self.input_audio_pipe} does not exist. Please create it before running.")
-                return
-
             # Start the OpenAIClient's main loop
             await self.openai_client.run()
 
@@ -92,13 +82,6 @@ class StreamAudioProcessor:
 
             self.running = False
             self.logger.info("Cleaning up StreamAudioProcessor...")
-
-            # Cancel all tasks
-            for task in self.tasks:
-                if not task.done():
-                    task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await task
 
             # Cleanup OpenAIClient
             await self.openai_client.disconnect(shutdown=True)
