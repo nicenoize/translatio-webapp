@@ -1,5 +1,3 @@
-# main.py
-
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,10 +8,12 @@ import asyncio
 from dotenv import load_dotenv
 import signal
 import logging
+from logging.handlers import RotatingFileHandler
+
 
 load_dotenv()
 
-from stream_processor.stream_audio_processor import StreamAudioProcessor  # Ensure this module imports OpenAIClient correctly
+from stream_processor.openai_client import OpenAIClient  # Ensure correct import path
 
 app = FastAPI()
 
@@ -36,8 +36,18 @@ should_exit = False
 # Initialize a logger for main.py
 main_logger = logging.getLogger("main")
 main_logger.setLevel(logging.DEBUG)
-main_logger.addHandler(logging.StreamHandler())
-main_logger.addHandler(logging.FileHandler("main.log"))
+
+# Add RotatingFileHandler for main.log
+app_handler = RotatingFileHandler("output/logs/main.log", maxBytes=5*1024*1024, backupCount=5)
+app_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+app_handler.setFormatter(app_formatter)
+main_logger.addHandler(app_handler)
+
+# Create and add console handler
+console_handler = logging.StreamHandler()
+console_formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+main_logger.addHandler(console_handler)
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
@@ -50,7 +60,7 @@ async def shutdown_event():
     global processor, should_exit
     should_exit = True
     if processor:
-        await processor.cleanup()
+        await processor.disconnect(shutdown=True)
 
 def signal_handler():
     asyncio.create_task(shutdown_event())
@@ -65,15 +75,16 @@ async def startup_event():
     stream_url = "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t"
     output_rtmp_url = "rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live"
 
-    # Initialize StreamAudioProcessor with the updated OpenAIClient
-    processor = StreamAudioProcessor(
-        openai_api_key=api_key,
-        stream_url=stream_url,
-        output_rtmp_url=output_rtmp_url
+    # Get the current event loop
+    loop = asyncio.get_running_loop()
+
+    # Initialize OpenAIClient with the event loop
+    processor = OpenAIClient(
+        api_key=api_key,
+        loop=loop
     )
     
     # Set up signal handlers
-    loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, signal_handler)
@@ -94,7 +105,7 @@ async def websocket_endpoint(websocket: WebSocket):
     
     # Register the WebSocket client
     try:
-        client_id = await processor.openai_client.register_websocket(websocket)
+        client_id = await processor.register_websocket(websocket)
     except Exception as e:
         main_logger.error(f"Failed to register WebSocket client: {e}")
         await websocket.close()
@@ -110,7 +121,7 @@ async def websocket_endpoint(websocket: WebSocket):
         main_logger.error(f"WebSocket error: {e}")
     finally:
         # Unregister the WebSocket client when the connection is closed
-        await processor.openai_client.unregister_websocket(client_id)
+        await processor.unregister_websocket(client_id)
 
 if __name__ == "__main__":
     uvicorn.run(
