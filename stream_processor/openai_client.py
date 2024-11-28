@@ -21,6 +21,7 @@ import time
 import cv2  # Import OpenCV
 from logging.handlers import RotatingFileHandler
 import subprocess
+import signal
 
 class OpenAIClient:
     def __init__(self, api_key: str, loop: asyncio.AbstractEventLoop):
@@ -120,7 +121,7 @@ class OpenAIClient:
         self.subtitle_queue = Queue()
 
         # Set segment duration for video splitting (e.g., 30 seconds)
-        self.segment_duration = 5  # in seconds (Set to 5 for testing)
+        self.segment_duration = 5  # in seconds
         self.segment_index = 1  # To keep track of video segments
         self.segment_start_time = None  # Start time of the current segment
 
@@ -561,7 +562,7 @@ class OpenAIClient:
                 continue
 
     async def write_subtitle(self, index, start_time, end_time, text):
-        """Write subtitle data directly to an SRT file for the current segment."""
+        """Write subtitle data directly to an SRT file for the current segment, splitting long texts."""
         try:
             self.logger.debug(f"Writing subtitle {index}: '{text}' from {start_time} to {end_time}")
 
@@ -574,24 +575,168 @@ class OpenAIClient:
             adjusted_end_time = end_time - self.segment_start_time
 
             if adjusted_end_time <= adjusted_start_time:
-                self.logger.warning(f"Invalid subtitle duration for index {index}")
+                self.logger.warning(f"Subtitle {index} skipped: Start time >= End time")
                 return
 
-            subtitle = srt.Subtitle(
-                index=index,
-                start=datetime.timedelta(seconds=adjusted_start_time),
-                end=datetime.timedelta(seconds=adjusted_end_time),
-                content=text
-            )
-            srt_content = srt.compose([subtitle])
+            # Define maximum characters per line
+            max_chars = 42
 
+            # Split text into lines not exceeding max_chars
+            lines = self.split_text_into_lines(text, max_chars)
+
+            # Calculate duration per subtitle based on number of lines
+            total_duration = adjusted_end_time - adjusted_start_time
+            duration_per_subtitle = total_duration / len(lines) if len(lines) > 0 else total_duration
+
+            subtitles = []
+            for i, line in enumerate(lines):
+                sub_start = datetime.timedelta(seconds=adjusted_start_time + i * duration_per_subtitle)
+                sub_end = datetime.timedelta(seconds=adjusted_start_time + (i + 1) * duration_per_subtitle)
+                subtitles.append(srt.Subtitle(index=index + i, start=sub_start, end=sub_end, content=line))
+
+            srt_content = srt.compose(subtitles)
             srt_output_path = f'output/subtitles/subtitles_segment_{self.segment_index}.srt'
             async with aiofiles.open(srt_output_path, 'a', encoding='utf-8') as f:
                 await f.write(srt_content)
             self.logger.info(f"Subtitle {index} for segment {self.segment_index} saved to {srt_output_path}")
 
+            # Increment subtitle index for each split line
+            self.subtitle_index += len(lines)
+
         except Exception as e:
             self.logger.error(f"Error writing subtitle {index}: {e}", exc_info=True)
+
+    def split_text_into_lines(self, text: str, max_chars: int) -> list:
+        """
+        Splits a long text into multiple lines, each not exceeding max_chars.
+        Attempts to split at word boundaries.
+        """
+        words = text.split()
+        lines = []
+        current_line = ""
+
+        for word in words:
+            if len(current_line) + len(word) + 1 <= max_chars:
+                current_line += (" " if current_line else "") + word
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+
+        if current_line:
+            lines.append(current_line)
+
+        return lines
+
+    def overlay_subtitles(self, frame, current_time):
+        """Overlay subtitles onto the frame based on the current time."""
+        try:
+            # Determine which subtitles to display
+            display_subtitles = [
+                s for s in self.subtitle_data_list
+                if s['start_time'] <= current_time <= s['end_time']
+            ]
+
+            y_offset = 50  # Starting y-coordinate for subtitles
+
+            for subtitle in display_subtitles:
+                text = subtitle['text']
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 1.0
+                color = (255, 255, 255)  # White color
+                thickness = 2
+
+                # Calculate text size
+                (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                x = int((frame.shape[1] - text_width) / 2)
+                y = frame.shape[0] - y_offset  # Position near the bottom
+
+                # Add background rectangle for better visibility
+                box_coords = (
+                    (x - 10, y - text_height - 10),
+                    (x + text_width + 10, y + 10)
+                )
+                cv2.rectangle(frame, box_coords[0], box_coords[1], (0, 0, 0), cv2.FILLED)
+
+                # Put the text on top of the rectangle
+                cv2.putText(frame, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+
+                y_offset += text_height + 20  # Adjust for next subtitle line if multiple
+
+        except Exception as e:
+            self.logger.error(f"Error overlaying subtitles: {e}", exc_info=True)
+
+    async def save_subtitles_to_srt(self, segment_index: int):
+        """Save accumulated subtitles to an SRT file for the segment."""
+        try:
+            if not self.subtitle_data_list:
+                self.logger.warning(f"No subtitles to save for segment {segment_index}.")
+                return
+
+            subtitles = []
+            for idx, subtitle in enumerate(self.subtitle_data_list, 1):
+                start_td = datetime.timedelta(seconds=subtitle['start_time'])
+                end_td = datetime.timedelta(seconds=subtitle['end_time'])
+                subtitles.append(srt.Subtitle(index=idx, start=start_td, end=end_td, content=subtitle['text']))
+
+            srt_content = srt.compose(subtitles)
+            srt_output_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
+            async with aiofiles.open(srt_output_path, 'w', encoding='utf-8') as f:
+                await f.write(srt_content)
+            self.logger.info(f"Subtitles for segment {segment_index} saved to {srt_output_path}")
+
+            # Clear subtitle data after saving
+            self.subtitle_data_list = []
+
+        except Exception as e:
+            self.logger.error(f"Error saving subtitles for segment {segment_index}: {e}", exc_info=True)
+
+    async def mux_video_audio(self, segment_index: int):
+        """Mux video segment with corresponding audio segment and subtitles using FFmpeg"""
+        video_path = f'output/video/output_video_segment_{segment_index}.mp4'
+        audio_path = f'output/audio/output_audio_segment_{segment_index}.wav'
+        subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
+        final_output_path = f'output/final/final_output_video_segment_{segment_index}.mp4'
+
+        # Check if video, audio, and subtitles files exist
+        missing_files = []
+        for path in [video_path, audio_path, subtitles_path]:
+            if not os.path.exists(path):
+                missing_files.append(path)
+        if missing_files:
+            self.logger.error(f"Missing files for muxing: {missing_files}. Cannot mux.")
+            return
+
+        # FFmpeg command to mux video, audio, and subtitles
+        ffmpeg_command = [
+            'ffmpeg',
+            '-y',
+            '-i', video_path,
+            '-i', audio_path,
+            '-vf', f"subtitles={subtitles_path}",
+            '-c:v', 'copy',  # Copy video stream without re-encoding
+            '-c:a', 'aac',   # Encode audio to AAC
+            '-strict', 'experimental',
+            final_output_path
+        ]
+
+        try:
+            self.logger.info(f"Muxing video, audio, and subtitles for segment {segment_index}...")
+            process = subprocess.run(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if process.returncode == 0:
+                self.logger.info(f"Successfully muxed video, audio, and subtitles into {final_output_path}")
+            else:
+                self.logger.error(f"FFmpeg muxing failed for segment {segment_index}.")
+                self.logger.error(f"FFmpeg stderr: {process.stderr}")
+        except Exception as e:
+            self.logger.error(f"Error during FFmpeg muxing: {e}", exc_info=True)
+        finally:
+            # Close the corresponding Wave_write object
+            async with self.segment_audio_lock:
+                wf = self.segment_audio_writers.pop(segment_index, None)
+                if wf:
+                    wf.close()
+                    self.logger.debug(f"Closed Wave_write object for segment {segment_index}")
 
     async def heartbeat(self):
         """Send periodic heartbeat pings to keep the WebSocket connection alive."""
@@ -619,7 +764,7 @@ class OpenAIClient:
             self.ws = None  # Reset the WebSocket connection
 
         if shutdown:
-            self.running = False  # Stop the video processing loop
+            self.running = False  # Stop all running loops and tasks
             # Shutdown queues
             if self.playback_task:
                 self.playback_task.cancel()
@@ -648,35 +793,6 @@ class OpenAIClient:
                     except Exception as e:
                         self.logger.error(f"Error closing Wave_write object for segment {segment_index}: {e}")
                 self.segment_audio_writers.clear()
-
-    async def run(self):
-        """Run the OpenAIClient."""
-        try:
-            await self.connect()
-        except Exception as e:
-            self.logger.error(f"Initial connection failed: {e}")
-            await self.reconnect()
-
-        # Start handling responses
-        handle_responses_task = asyncio.create_task(self.handle_responses())
-        # Start reading and sending audio
-        read_input_audio_task = asyncio.create_task(self.read_input_audio())
-        # Start heartbeat
-        heartbeat_task = asyncio.create_task(self.heartbeat())
-        # Start video processing
-        video_processing_task = asyncio.create_task(self.run_video_processing())
-        # Start muxing worker
-        muxing_queue_task = asyncio.create_task(self.muxing_worker())
-
-        # Wait for all tasks to complete
-        await asyncio.gather(
-            handle_responses_task,
-            read_input_audio_task,
-            heartbeat_task,
-            video_processing_task,
-            muxing_queue_task,
-            return_exceptions=True
-        )
 
     async def run_video_processing(self):
         """Run video processing within the asyncio event loop."""
@@ -776,125 +892,45 @@ class OpenAIClient:
         except Exception as e:
             self.logger.error(f"Error in video processing: {e}", exc_info=True)
 
-    def check_and_update_subtitles(self):
-        """Check for new subtitles and update the list."""
-        while not self.subtitle_queue.empty():
-            subtitle_data = self.subtitle_queue.get_nowait()
-            self.subtitle_data_list.append(subtitle_data)
-            self.logger.debug(f"Added subtitle: {subtitle_data}")
+    async def run(self):
+        """Run the OpenAIClient."""
+        # Handle graceful shutdown on signals
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self.loop.add_signal_handler(sig, lambda sig=sig: asyncio.create_task(self.shutdown(sig)))
 
-    def overlay_subtitles(self, frame, current_time):
-        """Overlay subtitles onto the frame."""
-        # Determine which subtitles to display
-        display_subtitles = [
-            s for s in self.subtitle_data_list
-            if s['start_time'] <= current_time <= s['end_time']
-        ]
+        while self.running:
+            try:
+                await self.connect()
+            except Exception as e:
+                self.logger.error(f"Initial connection failed: {e}")
+                await self.reconnect()
 
-        for subtitle in display_subtitles:
-            text = subtitle['text']
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 1.0
-            color = (255, 255, 255)  # White color
-            thickness = 2
+            # Start handling responses
+            handle_responses_task = asyncio.create_task(self.handle_responses())
+            # Start reading and sending audio
+            read_input_audio_task = asyncio.create_task(self.read_input_audio())
+            # Start heartbeat
+            heartbeat_task = asyncio.create_task(self.heartbeat())
+            # Start video processing
+            video_processing_task = asyncio.create_task(self.run_video_processing())
+            # Start muxing worker
+            muxing_queue_task = asyncio.create_task(self.muxing_worker())
 
-            # Calculate text size
-            (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-            x = int((frame.shape[1] - text_width) / 2)
-            y = frame.shape[0] - 50  # Position at the bottom
-
-            # Add background rectangle for better visibility
-            box_coords = (
-                (x - 10, y - text_height - 10),
-                (x + text_width + 10, y + 10)
+            # Wait for tasks to complete
+            done, pending = await asyncio.wait(
+                [handle_responses_task, read_input_audio_task, heartbeat_task, video_processing_task, muxing_queue_task],
+                return_when=asyncio.FIRST_EXCEPTION
             )
-            cv2.rectangle(frame, box_coords[0], box_coords[1], (0, 0, 0), cv2.FILLED)
 
-            # Put the text on top of the rectangle
-            cv2.putText(frame, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+            for task in pending:
+                task.cancel()
 
-    async def save_subtitles_to_srt(self, segment_index: int):
-        """Save accumulated subtitles to an SRT file for the segment."""
-        try:
-            if not self.subtitle_data_list:
-                self.logger.warning(f"No subtitles to save for segment {segment_index}.")
-                return
-
-            subtitles = []
-            for idx, subtitle in enumerate(self.subtitle_data_list, 1):
-                start_td = datetime.timedelta(seconds=subtitle['start_time'])
-                end_td = datetime.timedelta(seconds=subtitle['end_time'])
-                subtitles.append(srt.Subtitle(index=idx, start=start_td, end=end_td, content=subtitle['text']))
-
-            srt_content = srt.compose(subtitles)
-            srt_output_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
-            async with aiofiles.open(srt_output_path, 'w', encoding='utf-8') as f:
-                await f.write(srt_content)
-            self.logger.info(f"Subtitles for segment {segment_index} saved to {srt_output_path}")
-
-            # Clear subtitle data after saving
-            self.subtitle_data_list = []
-
-        except Exception as e:
-            self.logger.error(f"Error saving subtitles for segment {segment_index}: {e}", exc_info=True)
-
-    async def mux_video_audio(self, segment_index: int):
-        """Mux video segment with corresponding audio segment using FFmpeg"""
-        video_path = f'output/video/output_video_segment_{segment_index}.mp4'
-        audio_path = f'output/audio/output_audio_segment_{segment_index}.wav'
-        final_output_path = f'output/final/final_output_video_segment_{segment_index}.mp4'
-
-        # Check if both video and audio files exist
-        if not os.path.exists(video_path):
-            self.logger.error(f"Video segment {video_path} does not exist. Cannot mux audio.")
-            return
-        if not os.path.exists(audio_path):
-            self.logger.error(f"Audio segment {audio_path} does not exist. Cannot mux audio.")
-            return
-
-        # FFmpeg command to mux video and audio
-        ffmpeg_command = [
-            'ffmpeg',
-            '-y',
-            '-i', video_path,
-            '-i', audio_path,
-            '-c:v', 'copy',  # Copy video stream without re-encoding
-            '-c:a', 'aac',   # Encode audio to AAC
-            '-strict', 'experimental',
-            final_output_path
-        ]
-
-        try:
-            self.logger.info(f"Muxing video and audio for segment {segment_index}...")
-            process = subprocess.run(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if process.returncode == 0:
-                self.logger.info(f"Successfully muxed video and audio into {final_output_path}")
-            else:
-                self.logger.error(f"FFmpeg muxing failed for segment {segment_index}.")
-                self.logger.error(f"FFmpeg stderr: {process.stderr}")
-        except Exception as e:
-            self.logger.error(f"Error during FFmpeg muxing: {e}", exc_info=True)
-        finally:
-            # Close the corresponding Wave_write object
-            async with self.segment_audio_lock:
-                wf = self.segment_audio_writers.pop(segment_index, None)
-                if wf:
-                    wf.close()
-                    self.logger.debug(f"Closed Wave_write object for segment {segment_index}")
-
-    async def register_websocket(self, websocket: websockets.WebSocketServerProtocol) -> int:
-        """Register a new WebSocket client and return its unique ID."""
-        client_id = self.next_client_id
-        self.next_client_id += 1
-        self.websocket_clients[client_id] = websocket
-        self.logger.info(f"Registered WebSocket client {client_id}")
-        return client_id
-
-    async def unregister_websocket(self, client_id: int):
-        """Unregister a WebSocket client."""
-        if client_id in self.websocket_clients:
-            del self.websocket_clients[client_id]
-            self.logger.info(f"Unregistered WebSocket client {client_id}")
+    async def shutdown(self, sig):
+        """Cleanup tasks tied to the service's shutdown."""
+        self.logger.info(f"Received exit signal {sig.name}...")
+        await self.disconnect(shutdown=True)
+        self.logger.info("Shutdown complete.")
+        self.loop.stop()
 
     async def muxing_worker(self):
         """Placeholder for any future muxing tasks or workers."""
