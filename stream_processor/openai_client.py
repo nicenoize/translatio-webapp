@@ -103,10 +103,9 @@ class OpenAIClient:
 
         # Initialize subtitle variables
         self.subtitle_index = 1  # Subtitle entry index
-        self.current_subtitle = ""
-        self.speech_start_time = None  # Time when current speech starts
 
-        self.subtitle_file_path = 'output/subtitles/subtitles.srt'  # Define the path
+        # Define the path (will be per-segment)
+        # Removed self.subtitle_data_list as it's no longer needed
 
         # Initialize the send queue
         self.send_queue = Queue()
@@ -129,6 +128,9 @@ class OpenAIClient:
 
         # Initialize total frames
         self.total_frames = 0  # Total number of audio frames processed
+
+        # Initialize current segment index
+        self.segment_index = 1  # Starts at 1
 
     def create_named_pipe(self, pipe_name):
         """
@@ -235,7 +237,7 @@ class OpenAIClient:
         await self.send_queue.put(message)
 
     async def read_input_audio(self):
-        """Coroutine to read audio from input_audio_pipe and send to Realtime API"""
+        """Coroutine to read audio from input_audio_pipe, perform gender detection, and send to Realtime API"""
         self.logger.info("Starting to read from input_audio_pipe")
         while True:
             try:
@@ -248,6 +250,12 @@ class OpenAIClient:
                             continue
                         self.latest_input_audio = data  # Store for gender detection
 
+                        # Detect gender before sending
+                        gender = self.detect_gender(self.latest_input_audio)
+                        self.logger.debug(f"Detected gender: {gender}")
+                        selected_voice = self.get_voice_for_gender(gender)
+                        self.logger.debug(f"Selected voice for gender '{gender}': {selected_voice}")
+
                         # Record the timestamp when the audio chunk is read
                         timestamp = time.time()
                         self.input_audio_timestamps.append(timestamp)
@@ -258,7 +266,7 @@ class OpenAIClient:
                             "audio": base64_audio
                         }
                         await self.enqueue_message(json.dumps(append_event))
-                        self.logger.info(f"Enqueued audio chunk of size: {len(base64_audio)} bytes")
+                        self.logger.info(f"Enqueued audio chunk of size: {len(base64_audio)} bytes with voice '{selected_voice}'")
                         await asyncio.sleep(0.1)  # Prevent flooding
             except Exception as e:
                 self.logger.error(f"Error in read_input_audio: {e}", exc_info=True)
@@ -356,7 +364,7 @@ class OpenAIClient:
                 "model": "gpt-4o-realtime-preview-2024-10-01",
                 "modalities": ["text", "audio"],
                 "instructions": "You are a realtime translator. Please use the audio you receive and translate it into German. Try to match the tone, emotion, and duration of the original audio.",
-                "voice": "alloy",
+                "voice": "alloy",  # Initial voice; will be updated based on gender
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
                 "turn_detection": {
@@ -473,13 +481,6 @@ class OpenAIClient:
                     self.logger.debug("Audio buffer committed.")
                     self.last_audio_sent_time = time.time()
 
-                    # Detect gender and create response with appropriate voice
-                    gender = self.detect_gender(self.latest_input_audio)
-                    self.logger.debug(f"Detected gender: {gender}")
-                    selected_voice = self.get_voice_for_gender(gender)
-                    self.logger.debug(f"Selected voice: {selected_voice}")
-                    await self.create_response(selected_voice)
-
                     # Introduce a small delay to ensure all data is written
                     await asyncio.sleep(0.5)  # 500 milliseconds
 
@@ -538,7 +539,7 @@ class OpenAIClient:
                 continue
 
     async def write_subtitle(self, index, start_time, end_time, text):
-        """Write a single subtitle entry to the SRT file using the srt library, ensuring minimum duration."""
+        """Write a single subtitle entry to the per-segment SRT file, ensuring minimum duration."""
         try:
             # Ensure average_processing_delay is calculated
             if not self.processing_delays:
@@ -566,14 +567,21 @@ class OpenAIClient:
                 self.logger.warning(f"Subtitle {index} skipped: Start time >= End time")
                 return
 
+            # Determine the corresponding segment index
+            segment_index = max(self.segment_index - 1, 1)  # Ensure at least 1
+
+            # Define the per-segment SRT path
+            subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
+
+            # Create the subtitle
             subtitle = srt.Subtitle(index=index, start=start_td, end=end_td, content=text)
 
             # Open the SRT file in append mode and write the subtitle
-            async with aiofiles.open(self.subtitle_file_path, 'a', encoding='utf-8') as f:
+            async with aiofiles.open(subtitles_path, 'a', encoding='utf-8') as f:
                 await f.write(srt.compose([subtitle]))
                 await f.flush()
 
-            self.logger.info(f"Written subtitle entry {index}: '{text}'")
+            self.logger.info(f"Written subtitle entry {index} to {subtitles_path}: '{text}'")
         except Exception as e:
             self.logger.error(f"Error writing subtitle entry {index}: {e}", exc_info=True)
 
@@ -623,7 +631,7 @@ class OpenAIClient:
         self.logger.debug(f"Unregistered WebSocket client: {client_id}")
 
     async def broadcast_translation(self, text: str):
-        """Broadcast translation to all connected WebSocket clients and handle subtitles"""
+        """Broadcast translation to all connected WebSocket clients"""
         message = json.dumps({"type": "translation", "text": text})
         disconnected_clients = []
 
@@ -744,8 +752,7 @@ class OpenAIClient:
                     # Get current time relative to segment start
                     current_time = time.time() - self.segment_start_time
 
-                    # Overlay subtitles
-                    self.overlay_subtitles(frame, current_time)
+                    # Note: Removed overlay_subtitles call
 
                     # Write frame to output video
                     out.write(frame)
@@ -784,13 +791,27 @@ class OpenAIClient:
             self.logger.error(f"Audio segment {audio_path} does not exist. Cannot mux audio.")
             return
 
+        # Check if subtitles file exists
+        if not os.path.exists(subtitles_path):
+            self.logger.warning(f"Subtitles file {subtitles_path} does not exist. Proceeding without subtitles.")
+            subtitles_filter = ""
+        else:
+            subtitles_filter = f"subtitles={subtitles_path}"
+
         # FFmpeg command to mux video, audio, and subtitles
         ffmpeg_command = [
             'ffmpeg',
             '-y',
             '-i', video_path,
             '-i', audio_path,
-            '-vf', f"subtitles={subtitles_path}",
+        ]
+
+        if subtitles_filter:
+            ffmpeg_command += ['-vf', subtitles_filter]
+        else:
+            ffmpeg_command += ['-vf', '']
+
+        ffmpeg_command += [
             '-c:v', 'copy',  # Copy video stream without re-encoding
             '-c:a', 'aac',    # Encode audio to AAC
             '-strict', 'experimental',
@@ -812,49 +833,6 @@ class OpenAIClient:
                 self.logger.error(f"FFmpeg stderr: {stderr.decode()}")
         except Exception as e:
             self.logger.error(f"Error during FFmpeg muxing: {e}", exc_info=True)
-
-    async def overlay_subtitles(self, frame, current_time):
-        """
-        Overlay subtitles onto the frame based on the current time.
-
-        :param frame: Video frame to overlay subtitles on.
-        :param current_time: Current time relative to the segment start.
-        """
-        try:
-            # Determine which subtitles to display
-            display_subtitles = [
-                s for s in self.subtitle_data_list
-                if s['start_time'] <= current_time <= s['end_time']
-            ]
-
-            y_offset = 50  # Starting y-coordinate for subtitles
-
-            for subtitle in display_subtitles:
-                text = subtitle['text']
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 1.0
-                color = (255, 255, 255)  # White color
-                thickness = 2
-
-                # Calculate text size
-                (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-                x = int((frame.shape[1] - text_width) / 2)
-                y = frame.shape[0] - y_offset  # Position near the bottom
-
-                # Add background rectangle for better visibility
-                box_coords = (
-                    (x - 10, y - text_height - 10),
-                    (x + text_width + 10, y + 10)
-                )
-                cv2.rectangle(frame, box_coords[0], box_coords[1], (0, 0, 0), cv2.FILLED)
-
-                # Put the text on top of the rectangle
-                cv2.putText(frame, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
-
-                y_offset += text_height + 20  # Adjust for next subtitle line if multiple
-
-        except Exception as e:
-            self.logger.error(f"Error overlaying subtitles: {e}", exc_info=True)
 
     async def run(self):
         """Run the OpenAIClient."""
