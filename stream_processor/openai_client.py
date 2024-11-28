@@ -103,9 +103,7 @@ class OpenAIClient:
 
         # Initialize subtitle variables
         self.subtitle_index = 1  # Subtitle entry index
-
-        # Define the path (will be per-segment)
-        # Removed self.subtitle_data_list as it's no longer needed
+        self.current_subtitle = ""  # Current subtitle text
 
         # Initialize the send queue
         self.send_queue = Queue()
@@ -131,6 +129,9 @@ class OpenAIClient:
 
         # Initialize current segment index
         self.segment_index = 1  # Starts at 1
+
+        # Initialize synchronization lock
+        self.sync_lock = asyncio.Lock()
 
     def create_named_pipe(self, pipe_name):
         """
@@ -237,7 +238,7 @@ class OpenAIClient:
         await self.send_queue.put(message)
 
     async def read_input_audio(self):
-        """Coroutine to read audio from input_audio_pipe, perform gender detection, and send to Realtime API"""
+        """Coroutine to read audio from input_audio_pipe and send to Realtime API"""
         self.logger.info("Starting to read from input_audio_pipe")
         while True:
             try:
@@ -250,20 +251,20 @@ class OpenAIClient:
                             continue
                         self.latest_input_audio = data  # Store for gender detection
 
-                        # Detect gender before sending
-                        gender = self.detect_gender(self.latest_input_audio)
-                        self.logger.debug(f"Detected gender: {gender}")
-                        selected_voice = self.get_voice_for_gender(gender)
-                        self.logger.debug(f"Selected voice for gender '{gender}': {selected_voice}")
-
                         # Record the timestamp when the audio chunk is read
                         timestamp = time.time()
                         self.input_audio_timestamps.append(timestamp)
 
+                        # Detect gender before sending
+                        gender = self.detect_gender(self.latest_input_audio)
+                        self.logger.debug(f"Detected gender: {gender}")
+                        selected_voice = self.get_voice_for_gender(gender)
+
                         base64_audio = base64.b64encode(data).decode('utf-8')
                         append_event = {
                             "type": "input_audio_buffer.append",
-                            "audio": base64_audio
+                            "audio": base64_audio,
+                            "voice": selected_voice  # Include selected voice in the event
                         }
                         await self.enqueue_message(json.dumps(append_event))
                         self.logger.info(f"Enqueued audio chunk of size: {len(base64_audio)} bytes with voice '{selected_voice}'")
@@ -318,7 +319,10 @@ class OpenAIClient:
                     self.translated_audio_fd = os.open(self.translated_audio_pipe, os.O_WRONLY)
                     self.logger.info(f"Opened translated_audio_pipe for writing: {self.translated_audio_pipe}")
                 except OSError as e:
-                    self.logger.error(f"Error opening translated_audio_pipe for writing: {e}")
+                    if e.errno == errno.ENXIO:
+                        self.logger.warning(f"No reader for pipe {self.translated_audio_pipe}.")
+                    else:
+                        self.logger.error(f"Error opening translated_audio_pipe for writing: {e}")
                     return  # Exit the function if unable to open the pipe
 
             try:
@@ -364,7 +368,7 @@ class OpenAIClient:
                 "model": "gpt-4o-realtime-preview-2024-10-01",
                 "modalities": ["text", "audio"],
                 "instructions": "You are a realtime translator. Please use the audio you receive and translate it into German. Try to match the tone, emotion, and duration of the original audio.",
-                "voice": "alloy",  # Initial voice; will be updated based on gender
+                "voice": "alloy",  # This will be overridden per request based on gender
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
                 "turn_detection": {
@@ -460,7 +464,7 @@ class OpenAIClient:
                     speech_end_time = time.time()
 
                     # Ensure that there is subtitle text and start time before writing
-                    if self.current_subtitle.strip() and self.speech_start_time is not None:
+                    if self.current_subtitle.strip() and getattr(self, 'speech_start_time', None) is not None:
                         self.logger.debug("Current subtitle is not empty, writing subtitle.")
 
                         await self.write_subtitle(
@@ -480,9 +484,6 @@ class OpenAIClient:
                     await self.commit_audio_buffer()
                     self.logger.debug("Audio buffer committed.")
                     self.last_audio_sent_time = time.time()
-
-                    # Introduce a small delay to ensure all data is written
-                    await asyncio.sleep(0.5)  # 500 milliseconds
 
                 elif event_type == "response.audio.delta":
                     audio_data = event.get("delta", "")
@@ -522,6 +523,9 @@ class OpenAIClient:
                         # Accumulate subtitle text
                         self.current_subtitle += text
                         self.logger.debug(f"Accumulated subtitle text: {self.current_subtitle}")
+
+                        # Optionally, trigger muxing if both audio and subtitles are ready
+                        # This logic can be adjusted based on specific requirements
                 elif event_type in [
                     "response.audio.done",
                     "response.audio_transcript.done",
@@ -533,6 +537,13 @@ class OpenAIClient:
                     # These events are handled implicitly; no action needed
                 else:
                     self.logger.warning(f"Unhandled event type: {event_type}")
+
+                # After handling response, check if both audio and subtitles are ready to mux
+                if event_type in ["response.audio.done", "response.audio_transcript.done"]:
+                    # Acquire synchronization lock to prevent race conditions
+                    async with self.sync_lock:
+                        await self.determine_and_mux()
+
             except Exception as e:
                 self.logger.error(f"Error in handle_responses: {e}", exc_info=True)
                 await self.reconnect()
@@ -684,14 +695,14 @@ class OpenAIClient:
                 except Exception as e:
                     self.logger.error(f"Error closing output WAV file: {e}")
 
-    async def run_video_processing(self):
+    async def run_video_processing(self, segment_index: int, duration: float):
         """Run video processing within the asyncio event loop."""
-        await asyncio.to_thread(self.start_video_processing)
+        await asyncio.to_thread(self.start_video_processing, segment_index, duration)
 
-    def start_video_processing(self):
+    def start_video_processing(self, segment_index: int, duration: float):
         """Start video processing with OpenCV and dynamic subtitle overlay."""
         try:
-            self.logger.info("Starting video processing with OpenCV.")
+            self.logger.info(f"Starting video processing for segment {segment_index}.")
 
             # Open video capture
             cap = cv2.VideoCapture(self.stream_url)
@@ -711,73 +722,44 @@ class OpenAIClient:
 
             self.logger.info(f"Video properties - FPS: {fps}, Width: {width}, Height: {height}")
 
-            # Initialize variables for video segmentation
-            segment_frames = int(fps * 5)  # 5-second segments
+            # Calculate number of frames to capture based on duration and FPS
+            segment_frames = int(fps * duration)
             frame_count = 0
-            self.segment_index = 1  # Initialize segment index
-            self.segment_start_time = time.time()
 
-            while True:
-                # Define video writer for each segment
-                segment_output_path = f'output/video/output_video_segment_{self.segment_index}.mp4'
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 'mp4v' for MP4
-                out = cv2.VideoWriter(segment_output_path, fourcc, fps, (width, height))
+            # Define video writer for the segment
+            segment_output_path = f'output/video/output_video_segment_{segment_index}.mp4'
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 'mp4v' for MP4
+            out = cv2.VideoWriter(segment_output_path, fourcc, fps, (width, height))
 
-                if not out.isOpened():
-                    self.logger.error(f"Failed to open VideoWriter for segment {self.segment_index}.")
-                    self.running = False
+            if not out.isOpened():
+                self.logger.error(f"Failed to open VideoWriter for segment {segment_index}.")
+                self.running = False
+                return
+
+            self.logger.info(f"Started recording segment {segment_index} to {segment_output_path}")
+
+            start_time = time.time()
+
+            while frame_count < segment_frames and self.running:
+                ret, frame = cap.read()
+                if not ret:
+                    self.logger.warning("Failed to read frame from video stream.")
                     break
 
-                self.logger.info(f"Started recording segment {self.segment_index} to {segment_output_path}")
+                # Write frame to output video
+                out.write(frame)
+                frame_count += 1
 
-                # Initialize the corresponding audio segment file
-                audio_segment_path = f'output/audio/output_audio_segment_{self.segment_index}.wav'
-                try:
-                    wf = wave.open(audio_segment_path, 'wb')
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(24000)
-                    self.segment_audio_writers[self.segment_index] = wf
-                    self.logger.debug(f"Stored Wave_write object for segment {self.segment_index}")
-                except Exception as e:
-                    self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
-                    continue  # Proceed to next segment
-
-                while frame_count < segment_frames and self.running:
-                    ret, frame = cap.read()
-                    if not ret:
-                        self.logger.warning("Failed to read frame from video stream.")
-                        break
-
-                    # Get current time relative to segment start
-                    current_time = time.time() - self.segment_start_time
-
-                    # Note: Removed overlay_subtitles call
-
-                    # Write frame to output video
-                    out.write(frame)
-                    frame_count += 1
-
-                # Release the current segment video writer
-                out.release()
-                self.logger.info(f"Segment {self.segment_index} saved to {segment_output_path}.")
-
-                # Reset for next segment
-                self.segment_index += 1
-                frame_count = 0
-                self.segment_start_time = time.time()
-
-                # Schedule muxing of video and audio in the asyncio loop
-                asyncio.run_coroutine_threadsafe(
-                    self.mux_video_audio(self.segment_index - 1),
-                    asyncio.get_event_loop()
-                )
+            # Release the video writer and capture
+            out.release()
+            cap.release()
+            self.logger.info(f"Segment {segment_index} saved to {segment_output_path}.")
 
         except Exception as e:
-            self.logger.error(f"Error in video processing: {e}", exc_info=True)
+            self.logger.error(f"Error in video processing for segment {segment_index}: {e}", exc_info=True)
 
     async def mux_video_audio(self, segment_index: int):
-        """Mux video segment with corresponding audio segment using FFmpeg"""
+        """Mux video segment with corresponding audio and subtitles using FFmpeg"""
         video_path = f'output/video/output_video_segment_{segment_index}.mp4'
         audio_path = f'output/audio/output_audio_segment_{segment_index}.wav'
         subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
@@ -796,7 +778,8 @@ class OpenAIClient:
             self.logger.warning(f"Subtitles file {subtitles_path} does not exist. Proceeding without subtitles.")
             subtitles_filter = ""
         else:
-            subtitles_filter = f"subtitles={subtitles_path}"
+            # Ensure the subtitles path is correctly escaped for FFmpeg
+            subtitles_filter = f"subtitles='{subtitles_path}'"
 
         # FFmpeg command to mux video, audio, and subtitles
         ffmpeg_command = [
@@ -832,7 +815,35 @@ class OpenAIClient:
                 self.logger.error(f"FFmpeg muxing failed for segment {segment_index}.")
                 self.logger.error(f"FFmpeg stderr: {stderr.decode()}")
         except Exception as e:
-            self.logger.error(f"Error during FFmpeg muxing: {e}", exc_info=True)
+            self.logger.error(f"Error during FFmpeg muxing for segment {segment_index}: {e}", exc_info=True)
+
+    async def determine_and_mux(self):
+        """
+        Determine if both audio and subtitles are ready for the current segment,
+        calculate synchronization timings, and initiate muxing.
+        """
+        try:
+            # Define synchronization duration based on average processing delay and segment duration
+            # Assuming segment duration is 5 seconds
+            segment_duration = 5.0  # seconds
+            sync_duration = segment_duration + self.average_processing_delay
+
+            self.logger.debug(f"Determining synchronization timings with duration: {sync_duration} seconds")
+
+            # Start video processing for the segment
+            asyncio.create_task(self.run_video_processing(self.segment_index, sync_duration))
+
+            # After video processing, mux the components
+            # Here, we wait for the video segment to be saved before muxing
+            await asyncio.sleep(sync_duration + 1)  # Adding 1 second buffer
+
+            await self.mux_video_audio(self.segment_index)
+
+            # Increment the segment index for the next segment
+            self.segment_index += 1
+
+        except Exception as e:
+            self.logger.error(f"Error in determine_and_mux: {e}", exc_info=True)
 
     async def run(self):
         """Run the OpenAIClient."""
@@ -845,16 +856,15 @@ class OpenAIClient:
                 read_input_audio_task = asyncio.create_task(self.read_input_audio())
                 # Start heartbeat
                 heartbeat_task = asyncio.create_task(self.heartbeat())
-                # Start video processing
-                run_video_processing_task = asyncio.create_task(self.run_video_processing())
+                # Video processing is initiated after responses are handled
 
                 # Wait for tasks to complete or fail
                 done, pending = await asyncio.wait(
                     [
                         handle_responses_task,
                         read_input_audio_task,
-                        heartbeat_task,
-                        run_video_processing_task
+                        heartbeat_task
+                        # Video processing is triggered by responses
                     ],
                     return_when=asyncio.FIRST_EXCEPTION
                 )

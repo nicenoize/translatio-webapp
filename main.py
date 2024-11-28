@@ -37,7 +37,7 @@ should_exit = False
 main_logger = logging.getLogger("main")
 main_logger.setLevel(logging.DEBUG)
 main_logger.addHandler(logging.StreamHandler())
-main_logger.addHandler(logging.FileHandler("main.log"))
+main_logger.addHandler(logging.FileHandler("output/logs/main.log"))
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):

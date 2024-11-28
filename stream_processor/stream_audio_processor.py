@@ -28,7 +28,7 @@ class StreamAudioProcessor:
         # Initialize OpenAIClient with the new parameters
         self.openai_client = OpenAIClient(
             api_key=openai_api_key,
-            translated_audio_pipe=self.translated_audio_pipe,
+            translated_audio_pipe="translated_audio_pipe",
             enable_playback=enable_playback,
             min_subtitle_duration=min_subtitle_duration
         )
