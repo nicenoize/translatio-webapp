@@ -24,52 +24,37 @@ import signal
 import uuid
 
 
+from .event_tracker import EventTracker
+from .subtitle_manager import SubtitleManager
+from .audio_manager import AudioManager
+
+
+
 class OpenAIClient:
     def __init__(self, api_key: str, loop: asyncio.AbstractEventLoop):
         self.api_key = api_key
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.loop = loop  # Reference to the asyncio event loop
+        self.ws = None
+        self.loop = loop
         self.setup_logging()
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.logger.info("OpenAIClient initialized.")
-
-        self.running = True  # Initialize the running flag
-
-        # Initialize timestamp for audio chunks
-        self.audio_timestamps = deque(maxlen=100)
-
-        self.video_start_time: Optional[float] = None  # Will be set once when video processing starts
-        self.last_audio_sent_time: Optional[float] = None
-        self.last_translated_audio_received_time: Optional[float] = None
-        self.processing_delays = []
-        self.average_processing_delay = 0.0
-
-        # Define stream URL (Replace with your actual stream URL)
-        self.stream_url = 'https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t'
-
-        # Create directories for output if they don't exist
-        self.create_directories()
-
-        # Create named pipe for input audio
-        self.input_audio_pipe = os.path.abspath('input_audio_pipe')
-        self.create_named_pipe(self.input_audio_pipe)
-
-        # Open transcript file
-        transcript_dir = 'output/transcripts'
-        os.makedirs(transcript_dir, exist_ok=True)
-        self.transcript_file = open(os.path.join(transcript_dir, 'transcript.txt'), 'w', encoding='utf-8')
-        self.audio_counter = 0
-
-        # Initialize playback buffer using deque
-        self.playback_buffer = deque(maxlen=100)  # Adjust maxlen as needed
-        self.playback_event = asyncio.Event()  # Event to signal available audio
-
-        # Create task for playback
-        self.playback_task = asyncio.create_task(self.audio_playback_handler())
-
-        # Add a lock for reconnecting to prevent race conditions
-        self.is_reconnecting = False
-        self.reconnect_lock = asyncio.Lock()
+        
+        # Initialize managers
+        self.event_tracker = EventTracker()
+        self.subtitle_manager = SubtitleManager()
+        self.audio_manager = AudioManager()
+        
+        self.running = True
+        self.video_start_time = None
+        self.segment_index = 1
+        self.segment_duration = 5  # 5 seconds per segment
+        
+        # Setup queues and buffers
+        self.send_queue = Queue()
+        self.send_task = asyncio.create_task(self.send_messages())
+        
+        # Initialize other components
+        self.setup_directories_and_pipes()
+        self.initialize_gender_detection()
 
         # Initialize WAV file for output (for verification)
         try:
@@ -419,128 +404,140 @@ class OpenAIClient:
         self.logger.info(f"Enqueued response.create message with voice '{selected_voice}'")
 
     async def handle_responses(self):
-        """Handle translation responses from OpenAI"""
         while self.running:
             try:
                 response = await self.ws.recv()
                 event = json.loads(response)
                 event_type = event.get("type")
-                event_id = event.get("event_id")  # Not used anymore
-
-                self.logger.debug(f"Received event: {event_type} with event_id: {event_id}")
-
-                if event_type == "input_audio_buffer.speech_started":
-                    self.logger.info("Speech started")
-                    self.speech_start_time = time.perf_counter()
-                    self.logger.debug(f"Speech started at time: {self.speech_start_time}")
-
-                elif event_type == "input_audio_buffer.speech_stopped":
-                    self.logger.info("Speech stopped")
-                    speech_end_time = time.perf_counter()
-
-                    # Ensure that there is subtitle text and start time before writing
-                    if self.current_subtitle.strip() and self.speech_start_time is not None:
-                        self.logger.debug("Current subtitle is not empty, writing subtitle.")
-
-                        await self.write_subtitle(
-                            self.subtitle_index,
-                            self.speech_start_time,
-                            speech_end_time,
-                            self.current_subtitle.strip()
-                        )
-                        self.logger.debug(f"Subtitle written: {self.subtitle_index}")
-                        self.subtitle_index += 1
-                        self.current_subtitle = ""
-                        self.speech_start_time = None
-                    else:
-                        self.logger.debug("Current subtitle is empty or speech_start_time is None, skipping write_subtitle.")
-
-                    # Commit the audio buffer and create a response
-                    await self.commit_audio_buffer()
-                    self.logger.debug("Audio buffer committed.")
-                    self.last_audio_sent_time = time.perf_counter()
-
-                    # Detect gender and create response with appropriate voice
-                    gender = self.detect_gender(self.latest_input_audio)
-                    self.logger.debug(f"Detected gender: {gender}")
-                    selected_voice = self.get_voice_for_gender(gender)
-                    self.logger.debug(f"Selected voice: {selected_voice}")
-                    await self.create_response(selected_voice)
-
-                elif event_type == "response.audio.delta":
-                    audio_data = event.get("delta", "")
-                    # Directly associate with the current segment
-                    if audio_data:
-                        self.logger.info("Received audio delta")
-                        self.last_translated_audio_received_time = time.perf_counter()
-
-                        # Calculate processing delay if possible
-                        if self.last_audio_sent_time is not None:
-                            processing_delay = self.last_translated_audio_received_time - self.last_audio_sent_time
-                            self.processing_delays.append(processing_delay)
-                            self.logger.debug(f"Processing delay recorded: {processing_delay} seconds")
-
-                            # Update average processing delay
-                            if self.processing_delays:
-                                self.average_processing_delay = sum(self.processing_delays) / len(self.processing_delays)
-                                self.logger.debug(f"Updated average processing delay: {self.average_processing_delay} seconds")
-                        else:
-                            self.logger.warning("last_audio_sent_time is None. Cannot calculate processing delay.")
-
-                        try:
-                            decoded_audio = base64.b64decode(audio_data)
-                            if len(decoded_audio) == 0:
-                                self.logger.warning("Decoded audio data is empty.")
-                            else:
-                                self.logger.debug(f"Decoded audio data: {len(decoded_audio)} bytes")
-
-                            # Calculate the start time for this audio chunk
-                            start_time = time.perf_counter()
-
-                            await self.enqueue_audio(decoded_audio, start_time)
-                            self.logger.debug("Processed translated audio chunk.")
-                        except Exception as e:
-                            self.logger.error(f"Error handling audio data: {e}", exc_info=True)
-                    else:
-                        self.logger.debug("Received empty audio delta.")
-
+                event_id = event.get("event_id")
+                
+                if not event_id:
+                    continue
+                    
+                if event_type == "response.audio.delta":
+                    await self.handle_audio_delta(event)
                 elif event_type == "response.audio_transcript.delta":
-                    text = event.get("delta", "")
-                    if text.strip():
-                        self.logger.info(f"Translated text received: {text}")
-                        # Accumulate subtitle text
-                        self.current_subtitle += text
-                        self.logger.debug(f"Accumulated subtitle text: '{self.current_subtitle}'")
-                    else:
-                        self.logger.debug("Received empty transcript delta.")
-                        self.logger.debug(f"Accumulated subtitle text: {self.current_subtitle}")
-
-                elif event_type in [
-                    "response.audio.done",
-                    "response.audio_transcript.done",
-                    "response.content_part.done",
-                    "response.output_item.done",
-                    "response.done"
-                ]:
-                    self.logger.debug(f"Handled event type: {event_type}")
-                    # No additional action needed
-
-                else:
-                    self.logger.warning(f"Unhandled event type: {event_type}")
-            except websockets.exceptions.ConnectionClosedOK as e:
-                self.logger.warning(f"WebSocket connection closed normally: {e}")
-                await self.reconnect()
-            except websockets.exceptions.ConnectionClosedError as e:
-                self.logger.error(f"WebSocket connection closed with error: {e}")
-                await self.reconnect()
-            except json.JSONDecodeError as e:
-                self.logger.error(f"JSON decode error: {e} for response: {response}")
-            except KeyError as e:
-                self.logger.error(f"Missing key in response: {e} for response: {response}")
+                    await self.handle_transcript_delta(event)
+                elif event_type == "response.done":
+                    await self.handle_response_done(event_id)
             except Exception as e:
-                self.logger.error(f"Unexpected error in handle_responses: {e}", exc_info=True)
+                self.logger.error(f"Error in handle_responses: {e}")
                 await self.reconnect()
-                continue
+
+    async def mux_segment(self, segment_index, video_path, audio_path):
+        """Enhanced muxing with improved synchronization"""
+        subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
+        final_path = f'output/final/output_final_video_segment_{segment_index}.mp4'
+        
+        try:
+            # First overlay subtitles
+            overlay_result = await self.overlay_subtitles_via_ffmpeg(
+                video_path,
+                subtitles_path
+            )
+            
+            if not overlay_result:
+                return
+                
+            # Then mux with audio
+            await self.mux_video_audio_ffmpeg(
+                overlay_result,
+                audio_path,
+                final_path,
+                self.segment_duration
+            )
+            
+            # Cleanup temporary files
+            await self.cleanup_temp_files(segment_index)
+            
+        except Exception as e:
+            self.logger.error(f"Error in muxing segment {segment_index}: {e}")
+
+    def calculate_segment_index(self, timestamp):
+        """Calculate segment index based on timestamp"""
+        if self.video_start_time is None:
+            return 1
+        return int((timestamp - self.video_start_time) / self.segment_duration) + 1
+
+    async def handle_audio_delta(self, event):
+        event_id = event.get("event_id")
+        audio_data = event.get("delta", "")
+        
+        if not audio_data:
+            return
+            
+        try:
+            decoded_audio = base64.b64decode(audio_data)
+            event_data = self.event_tracker.get_event_data(event_id)
+            
+            if event_data:
+                segment_index = self.calculate_segment_index(event_data.timestamp)
+                await self.audio_manager.write_audio(segment_index, decoded_audio)
+                
+                self.event_tracker.update_event(
+                    event_id,
+                    translated_audio=decoded_audio
+                )
+        except Exception as e:
+            self.logger.error(f"Error handling audio delta: {e}")
+
+    async def handle_transcript_delta(self, event):
+        event_id = event.get("event_id")
+        text = event.get("delta", "")
+        
+        if text.strip():
+            event_data = self.event_tracker.get_event_data(event_id)
+            if event_data:
+                segment_index = self.calculate_segment_index(event_data.timestamp)
+                await self.subtitle_manager.add_subtitle(
+                    text=text,
+                    start_time=event_data.timestamp - self.video_start_time,
+                    end_time=event_data.timestamp - self.video_start_time + len(text) * 0.06,
+                    segment_index=segment_index
+                )
+                
+                self.event_tracker.update_event(
+                    event_id,
+                    translated_text=text
+                )
+
+    async def handle_response_done(self, event_id):
+        self.event_tracker.update_event(
+            event_id,
+            processing_complete=True
+        )
+        
+        # Process any pending events
+        for event_id in self.event_tracker.get_pending_events():
+            if self.event_tracker.is_event_complete(event_id):
+                event_data = self.event_tracker.get_event_data(event_id)
+                segment_index = self.calculate_segment_index(event_data.timestamp)
+                
+                # Trigger segment processing if we have all components
+                await self.process_segment(segment_index)
+
+    async def process_segment(self, segment_index):
+        """Process a completed segment with video, audio, and subtitles."""
+        try:
+            # Ensure audio writer is closed
+            audio_path = await self.audio_manager.close_segment(segment_index)
+            
+            if not audio_path:
+                return
+                
+            video_path = f'output/video/output_video_segment_{segment_index}.mp4'
+            subtitles = self.subtitle_manager.get_subtitles_for_segment(segment_index)
+            
+            if not os.path.exists(video_path) or not subtitles:
+                return
+                
+            await self.mux_segment(
+                segment_index,
+                video_path,
+                audio_path
+            )
+        except Exception as e:
+            self.logger.error(f"Error processing segment {segment_index}: {e}")
 
     async def write_subtitle(self, index: int, start_time: float, end_time: float, text: str):
         """Write subtitle data directly to an SRT file for the current segment."""
@@ -995,18 +992,34 @@ class OpenAIClient:
             await asyncio.sleep(1)  # Currently no tasks, keep the coroutine alive.
 
     async def send_input_audio_buffer_append(self, audio_data: bytes):
-        """Send input_audio_buffer.append event with a unique event_id."""
-        event_id = self.generate_event_id()
+        """Send audio with event tracking"""
+        event_id = str(uuid.uuid4())
+        timestamp = time.perf_counter()
+        
+        self.event_tracker.register_input_event(event_id, timestamp, audio_data)
+        
         audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-        input_audio_append_event = {
+        event = {
             "event_id": event_id,
             "type": "input_audio_buffer.append",
             "audio": audio_base64
         }
-        await self.enqueue_message(json.dumps(input_audio_append_event))
-        self.logger.debug(f"Enqueued input_audio_buffer.append event with event_id: {event_id}")
-        # Note: No mapping since server event_ids are different
+        await self.enqueue_message(json.dumps(event))
+    
 
+    def setup_directories_and_pipes(self):
+        self.create_directories()
+        self.input_audio_pipe = os.path.abspath('input_audio_pipe')
+        self.create_named_pipe(self.input_audio_pipe)
+
+    def initialize_gender_detection(self):
+        self.gender_voice_map = {
+            'male': ['alloy', 'ash', 'coral'],
+            'female': ['echo', 'shimmer', 'ballad', 'sage', 'verse']
+        }
+
+    self.current_voice = {'male': 0, 'female': 1}
+    self.latest_input_audio = b''
     async def send_session_update_with_event_id(self, event_id: str):
         """Send a session.update event with a specific event_id."""
         session_update_event = {

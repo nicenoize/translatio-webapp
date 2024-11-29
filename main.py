@@ -17,11 +17,6 @@ from stream_processor.openai_client import OpenAIClient  # Ensure correct import
 
 app = FastAPI()
 
-# Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Setup templates
-templates = Jinja2Templates(directory="templates")
 
 # Stream URLs
 STREAM_URLS = {
@@ -29,105 +24,28 @@ STREAM_URLS = {
     "translated": "https://demo.nanocosmos.de/nanoplayer/embed/1.3.3/nanoplayer.html?group.id=52e4d770-7c2d-4615-b1c7-d51bc34350c4&options.adaption.rule=deviationOfMean2&startIndex=0&playback.latencyControlMode=balancedadaptive"
 }
 
-# Global reference to the processor
-processor = None
-should_exit = False
-
-# Initialize a logger for main.py
-main_logger = logging.getLogger("main")
-main_logger.setLevel(logging.DEBUG)
-
-# Add RotatingFileHandler for main.log
-app_handler = RotatingFileHandler("output/logs/main.log", maxBytes=5*1024*1024, backupCount=5)
-app_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-app_handler.setFormatter(app_formatter)
-main_logger.addHandler(app_handler)
-
-# Create and add console handler
-console_handler = logging.StreamHandler()
-console_formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(console_formatter)
-main_logger.addHandler(console_handler)
-
-@app.get("/", response_class=HTMLResponse)
-async def root(request: Request):
-    return templates.TemplateResponse(
-        "index.html",
-        {"request": request, "stream_urls": STREAM_URLS}
-    )
-
-async def shutdown_event():
-    global processor, should_exit
-    should_exit = True
-    if processor:
-        await processor.disconnect(shutdown=True)
-
-def signal_handler():
-    asyncio.create_task(shutdown_event())
-
-@app.on_event("startup")
-async def startup_event():
-    global processor
-    api_key = os.getenv("OPENAI_API_KEY")
+async def main():
+    # Get API key from environment variable
+    api_key = os.getenv('OPENAI_API_KEY')
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable not set")
-        
-    stream_url = "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t"
-    output_rtmp_url = "rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live"
 
-    # Get the current event loop
-    loop = asyncio.get_running_loop()
-
-    # Initialize OpenAIClient with the event loop
-    processor = OpenAIClient(
-        api_key=api_key,
-        loop=loop
-    )
+    # Get event loop
+    loop = asyncio.get_event_loop()
     
-    # Set up signal handlers
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError:
-            # Signal handlers are not implemented on some systems (e.g., Windows)
-            pass
-    
-    # Start the processor's run method
-    asyncio.create_task(processor.run())
-
-@app.on_event("shutdown")
-async def shutdown():
-    await shutdown_event()
-
-@app.websocket("/ws/translations")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    
-    # Register the WebSocket client
-    try:
-        client_id = await processor.register_websocket(websocket)
-    except Exception as e:
-        main_logger.error(f"Failed to register WebSocket client: {e}")
-        await websocket.close()
-        return
+    # Initialize client
+    client = OpenAIClient(api_key, loop)
     
     try:
-        while True:
-            # Keep the connection alive by awaiting any messages
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        main_logger.info(f"WebSocket client {client_id} disconnected.")
-    except Exception as e:
-        main_logger.error(f"WebSocket error: {e}")
+        # Run the client
+        await client.run()
+    except KeyboardInterrupt:
+        # Handle graceful shutdown
+        await client.shutdown(signal.SIGINT)
     finally:
-        # Unregister the WebSocket client when the connection is closed
-        await processor.unregister_websocket(client_id)
+        # Ensure cleanup
+        await client.disconnect(shutdown=True)
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app", 
-        host="0.0.0.0", 
-        port=8000,
-        log_level="info",
-        reload=False  # Disable reload to prevent multiple processor instances
-    )
+    # Run the application
+    asyncio.run(main())
