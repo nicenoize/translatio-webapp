@@ -114,8 +114,11 @@ class OpenAIClient:
         # Initialize total frames
         self.total_frames = 0  # Total number of audio frames processed
 
-        # Set segment duration for video splitting (e.g., 5 seconds)
-        self.segment_duration = 10  # in seconds
+        # Define segment duration (in seconds)
+        self.segment_duration = 5  # Fixed segment length in seconds
+
+        # Set audio chunk size based on segment duration and audio format
+        self.audio_chunk_size = int(24000 * self.segment_duration)  # 24000 Hz * segment_duration
         self.segment_index = 1  # To keep track of video segments
         self.segment_start_time = None  # Start time of the current segment
 
@@ -244,31 +247,34 @@ class OpenAIClient:
         await self.send_queue.put(message)
 
     async def read_input_audio(self):
-        """Coroutine to read audio from input_audio_pipe and send to Realtime API"""
+        """Coroutine to read audio and align chunks with segment size."""
         self.logger.info("Starting to read from input_audio_pipe")
+        chunk_buffer = b""  # Buffer for incomplete chunks
         while self.running:
             try:
-                # Open the named pipe in binary read mode
                 async with aiofiles.open(self.input_audio_pipe, 'rb') as pipe:
                     while self.running:
-                        data = await pipe.read(65536)  # Increased buffer size to 64KB
+                        data = await pipe.read(65536)
                         if not data:
-                            self.logger.debug('No audio data available')
-                            await asyncio.sleep(0.05)  # Further reduced sleep
+                            await asyncio.sleep(0.05)
                             continue
-                        self.latest_input_audio = data  # Store for gender detection
 
-                        # Record the timestamp when the audio chunk is read
-                        timestamp = time.perf_counter()
-                        self.audio_timestamps.append(timestamp)
+                        chunk_buffer += data
 
-                        await self.send_input_audio_buffer_append(data)
-                        self.logger.info(f"Enqueued audio chunk of size: {len(data)} bytes")
+                        # Process full chunks
+                        while len(chunk_buffer) >= self.audio_chunk_size:
+                            chunk = chunk_buffer[:self.audio_chunk_size]
+                            chunk_buffer = chunk_buffer[self.audio_chunk_size:]
+                            timestamp = time.perf_counter()
+                            self.audio_timestamps.append(timestamp)
+                            await self.send_input_audio_buffer_append(chunk)
+                            self.logger.info(f"Sent aligned audio chunk of size {len(chunk)} bytes")
 
-                        await asyncio.sleep(0.05)  # Reduced sleep to minimize latency
+                        await asyncio.sleep(0.05)
             except Exception as e:
                 self.logger.error(f"Error in read_input_audio: {e}", exc_info=True)
-                await asyncio.sleep(1)  # Prevent tight loop on error
+                await asyncio.sleep(1)
+
 
     async def audio_playback_handler(self):
         """Handles playback of translated audio chunks."""
@@ -286,52 +292,54 @@ class OpenAIClient:
                 continue
 
     async def process_playback_chunk(self, audio_data: bytes, start_time: float):
-        """Process and play a single translated audio chunk for playback and save to WAV"""
+        """Play translated audio chunk and synchronize it with video playback."""
         try:
-            # Calculate delay to synchronize with video start time
             if self.video_start_time is None:
                 self.logger.warning("Video start time is not initialized.")
                 return
 
-            # Calculate the expected playback time relative to video start
             elapsed_time = start_time - self.video_start_time
-            expected_playback_time = self.video_start_time + elapsed_time
+            playback_start_time = self.video_start_time + elapsed_time
             current_time = time.perf_counter()
-            delay = expected_playback_time - current_time
+            delay = playback_start_time - current_time
+
             if delay > 0:
-                self.logger.debug(f"Delaying audio playback for {delay:.3f} seconds to synchronize with video.")
+                self.logger.debug(f"Delaying audio playback for {delay:.3f} seconds.")
                 await asyncio.sleep(delay)
 
-            # Play the audio using simpleaudio
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
             play_obj = sa.play_buffer(audio_array, 1, 2, 24000)
             await asyncio.to_thread(play_obj.wait_done)
-            self.logger.debug("Played translated audio chunk.")
+            self.logger.info("Played translated audio chunk.")
 
-            # Write to the output WAV file
+            # Save the chunk to the output WAV file
             if self.output_wav:
                 self.output_wav.writeframes(audio_data)
-                self.logger.debug("Written translated audio chunk to WAV file.")
-
-            # Write to the corresponding per-segment audio WAV file
-            async with self.segment_audio_lock:
-                wf = self.segment_audio_writers.get(self.segment_index)
-                if wf:
-                    wf.writeframes(audio_data)
-                    self.logger.debug(f"Written translated audio chunk to segment {self.segment_index} WAV file.")
-                else:
-                    self.logger.error(f"No Wave_write object found for segment {self.segment_index}")
-
+                self.logger.debug("Written audio chunk to WAV file.")
         except Exception as e:
-            self.logger.error(f"Error processing playback chunk: {e}", exc_info=True)
+            self.logger.error(f"Error in process_playback_chunk: {e}", exc_info=True)
+
 
     async def enqueue_audio(self, audio_data: bytes, start_time: float):
-        """Enqueue translated audio data with its start time into playback buffer"""
+        """Enqueue translated audio data with its start time into playback buffer."""
         self.logger.debug("Received audio chunk, buffering.")
         self.audio_buffer.append((audio_data, start_time))
 
-        # Signal the playback handler
+        # Adjust subtitle timing to match playback
+        if self.speech_start_time is not None:
+            speech_end_time = time.perf_counter()
+            await self.write_subtitle(
+                self.subtitle_index,
+                self.speech_start_time,
+                speech_end_time,
+                self.current_subtitle.strip()
+            )
+            self.current_subtitle = ""
+            self.speech_start_time = None
+
         self.playback_event.set()
+
+
 
     async def connect(self):
         """Connect to OpenAI's Realtime API and initialize session"""
@@ -551,78 +559,79 @@ class OpenAIClient:
                 await self.reconnect()
                 continue
 
+    async def finalize_subtitles(self):
+        """Finalize and save subtitles for FFmpeg processing."""
+        try:
+            srt_output_path = f'output/subtitles/subtitles_segment_{self.segment_index}.srt'
+            subtitles = [
+                srt.Subtitle(
+                    i + 1,
+                    datetime.timedelta(seconds=entry['start_time']),
+                    datetime.timedelta(seconds=entry['end_time']),
+                    entry['text']
+                )
+                for i, entry in enumerate(self.subtitle_data_list)
+            ]
+            if not subtitles:
+                self.logger.warning(f"No subtitles to finalize for segment {self.segment_index}.")
+                return
+
+            async with aiofiles.open(srt_output_path, 'w', encoding='utf-8') as f:
+                await f.write(srt.compose(subtitles))
+
+            self.logger.info(f"Finalized subtitles saved to {srt_output_path}.")
+        except Exception as e:
+            self.logger.error(f"Error finalizing subtitles: {e}", exc_info=True)
+
+
+
     async def write_subtitle(self, index: int, start_time: float, end_time: float, text: str):
         """Write subtitle data directly to an SRT file for the current segment."""
         try:
-            self.logger.debug(f"Writing subtitle {index}: '{text}' from {start_time} to {end_time}")
+            adjusted_start_time = max(0, start_time - self.video_start_time)
+            adjusted_end_time = max(0, end_time - self.video_start_time)
 
-            # Calculate durations relative to video start time
-            if self.video_start_time is None:
-                self.logger.warning("Video start time is not initialized.")
-                return
+            # Ensure minimum subtitle duration
+            min_duration = 1.5  # seconds
+            if adjusted_end_time - adjusted_start_time < min_duration:
+                adjusted_end_time = adjusted_start_time + min_duration
 
-            adjusted_start_time = start_time - self.video_start_time
-            adjusted_end_time = end_time - self.video_start_time
+            # Merge with the last subtitle if overlapping
+            if self.subtitle_data_list:
+                last_subtitle = self.subtitle_data_list[-1]
+                if adjusted_start_time < last_subtitle['end_time']:
+                    last_subtitle['end_time'] = max(last_subtitle['end_time'], adjusted_end_time)
+                    last_subtitle['text'] += f" {text}"
+                    return
 
-            if adjusted_end_time <= adjusted_start_time:
-                self.logger.warning(f"Subtitle {index} skipped: Start time >= End time")
-                return
+            # Add a new subtitle entry
+            self.subtitle_data_list.append({
+                'start_time': adjusted_start_time,
+                'end_time': adjusted_end_time,
+                'text': text
+            })
 
-            # Define maximum characters per line
-            max_chars = 42
-
-            # Split text into lines not exceeding max_chars
-            lines = self.split_text_into_lines(text, max_chars)
-
-            # Calculate duration per subtitle based on number of lines
-            total_duration = adjusted_end_time - adjusted_start_time
-            duration_per_subtitle = total_duration / len(lines) if len(lines) > 0 else total_duration
-
-            subtitles = []
-            for i, line in enumerate(lines):
-                sub_start = datetime.timedelta(seconds=adjusted_start_time + i * duration_per_subtitle)
-                sub_end = datetime.timedelta(seconds=adjusted_start_time + (i + 1) * duration_per_subtitle)
-                subtitles.append(srt.Subtitle(index=index + i, start=sub_start, end=sub_end, content=line))
-                # Append to subtitle_data_list for overlay
-                self.subtitle_data_list.append({
-                    'start_time': adjusted_start_time + i * duration_per_subtitle,
-                    'end_time': adjusted_start_time + (i + 1) * duration_per_subtitle,
-                    'text': line
-                })
-
-            srt_content = srt.compose(subtitles)
-            srt_output_path = f'output/subtitles/subtitles_segment_{self.segment_index}.srt'
-            async with aiofiles.open(srt_output_path, 'a', encoding='utf-8') as f:
-                await f.write(srt_content)
-            self.logger.info(f"Subtitle {index} for segment {self.segment_index} saved to {srt_output_path}")
-
-            # Increment subtitle index for each split line
-            self.subtitle_index += len(lines)
-
+            # Write subtitles to file
+            await self.finalize_subtitles()
         except Exception as e:
             self.logger.error(f"Error writing subtitle {index}: {e}", exc_info=True)
 
-    def split_text_into_lines(self, text: str, max_chars: int) -> list:
-        """
-        Splits a long text into multiple lines, each not exceeding max_chars.
-        Attempts to split at word boundaries.
-        """
-        words = text.split()
-        lines = []
-        current_line = ""
 
+
+    def split_text_into_lines(self, text: str, max_chars: int) -> list:
+        """Split a long text into lines, limiting characters per line."""
+        words = text.split()
+        lines, current_line = [], ""
         for word in words:
             if len(current_line) + len(word) + 1 <= max_chars:
                 current_line += (" " if current_line else "") + word
             else:
-                if current_line:
-                    lines.append(current_line)
+                lines.append(current_line)
                 current_line = word
-
         if current_line:
             lines.append(current_line)
-
         return lines
+
 
     async def overlay_subtitles_via_ffmpeg(self, video_path: str, subtitles_path: str) -> Optional[str]:
         """Overlay subtitles onto the video using FFmpeg and save as a new file."""
@@ -673,140 +682,68 @@ class OpenAIClient:
             self.logger.error(f"Error managing final output folder: {e}", exc_info=True)
 
     async def mux_video_audio(self, segment_index: int):
-        """Mux video segment with corresponding audio segment and subtitles using FFmpeg"""
+        """Mux video segment with corresponding audio segment and subtitles using FFmpeg."""
         video_path = f'output/video/output_video_segment_{segment_index}.mp4'
         audio_path = f'output/audio/output_audio_segment_{segment_index}.wav'
         subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
-        final_output_path = f'output/final/output_final_video_segment_{segment_index}.mp4'  # Save in output/final
+        final_output_path = f'output/final/output_video_segment_{segment_index}.mp4'
 
-        # Check if video, audio, and subtitles files exist
-        missing_files = []
+        # Check for missing files
         for path in [video_path, audio_path, subtitles_path]:
             if not os.path.exists(path):
-                missing_files.append(path)
-        if missing_files:
-            self.logger.error(f"Missing files for muxing: {missing_files}. Cannot mux.")
-            return
-
-        # **Critical Fix:** Close the Wave_write object before muxing
-        async with self.segment_audio_lock:
-            wf = self.segment_audio_writers.pop(segment_index, None)
-            if wf:
-                wf.close()
-                self.logger.debug(f"Closed Wave_write object for segment {segment_index}")
-            else:
-                self.logger.error(f"No Wave_write object found for segment {segment_index}")
-
-        # Define a temporary video file with subtitles
-        temp_video_with_subs = f'output/video/output_video_segment_{segment_index}_temp.mp4'
-
-        # FFmpeg command to overlay subtitles
-        ffmpeg_subtitles_command = [
-            'ffmpeg',
-            '-y',
-            '-i', video_path,
-            '-vf', f"subtitles={subtitles_path}:force_style='FontSize=24,PrimaryColour=&HFFFFFF&'",
-            '-c:v', 'libx264',  # Re-encode video to ensure compatibility
-            '-c:a', 'copy',      # No audio in video
-            temp_video_with_subs
-        ]
-
-        try:
-            self.logger.info(f"Overlaying subtitles onto video segment {segment_index}...")
-            process_subs = subprocess.run(ffmpeg_subtitles_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-            if process_subs.returncode != 0:
-                self.logger.error(f"FFmpeg subtitle overlay failed for segment {segment_index}.")
-                self.logger.error(f"FFmpeg stderr: {process_subs.stderr}")
+                self.logger.error(f"Missing file: {path}. Skipping muxing for segment {segment_index}.")
                 return
 
-            # **New Step:** Calculate padding duration and pad audio if necessary
-            # Open the audio WAV file to get its duration
-            with wave.open(audio_path, 'rb') as wf_audio:
-                num_frames = wf_audio.getnframes()
-                framerate = wf_audio.getframerate()
-                audio_duration = num_frames / float(framerate)
+        # Ensure audio padding if necessary
+        try:
+            with wave.open(audio_path, 'rb') as wf:
+                num_frames = wf.getnframes()
+                framerate = wf.getframerate()
+                audio_duration = num_frames / framerate
 
-            required_duration = self.segment_duration
-            pad_duration = required_duration - audio_duration
+            if audio_duration < self.segment_duration:
+                silence_duration = self.segment_duration - audio_duration
+                silence_path = f'output/audio/silence_{segment_index}.wav'
+                padded_audio_path = f'output/audio/padded_{segment_index}.wav'
 
-            if pad_duration > 0:
-                self.logger.debug(f"Padding audio with {pad_duration:.3f} seconds of silence.")
-
-                # Generate silence audio using FFmpeg
-                silence_path = f'output/audio/silence_segment_{segment_index}.wav'
+                # Generate silence
                 ffmpeg_silence_command = [
-                    'ffmpeg',
-                    '-y',
-                    '-f', 'lavfi',
-                    '-i', f'anullsrc=r={framerate}:cl=mono',
-                    '-t', f'{pad_duration:.3f}',
-                    '-c:a', 'pcm_s16le',
-                    silence_path
+                    'ffmpeg', '-y', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono',
+                    '-t', f'{silence_duration:.3f}', '-c:a', 'pcm_s16le', silence_path
                 ]
-                process_silence = subprocess.run(ffmpeg_silence_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run(ffmpeg_silence_command)
 
-                if process_silence.returncode != 0:
-                    self.logger.error(f"FFmpeg failed to generate silence for segment {segment_index}.")
-                    self.logger.error(f"FFmpeg stderr: {process_silence.stderr}")
-                    return
-
-                # Concatenate original audio with silence
-                padded_audio_path = f'output/audio/output_audio_segment_{segment_index}_padded.wav'
+                # Concatenate original audio and silence
                 ffmpeg_concat_command = [
-                    'ffmpeg',
-                    '-y',
-                    '-i', audio_path,
-                    '-i', silence_path,
-                    '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[a]',
-                    '-map', '[a]',
-                    '-c:a', 'pcm_s16le',
-                    padded_audio_path
+                    'ffmpeg', '-y', '-i', audio_path, '-i', silence_path,
+                    '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[a]', '-map', '[a]',
+                    '-c:a', 'pcm_s16le', padded_audio_path
                 ]
-                process_concat = subprocess.run(ffmpeg_concat_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-                if process_concat.returncode != 0:
-                    self.logger.error(f"FFmpeg failed to concatenate audio and silence for segment {segment_index}.")
-                    self.logger.error(f"FFmpeg stderr: {process_concat.stderr}")
-                    return
+                subprocess.run(ffmpeg_concat_command)
             else:
-                padded_audio_path = audio_path  # No padding needed
+                padded_audio_path = audio_path
 
-            # FFmpeg command to mux video with padded audio
-            ffmpeg_mux_command = [
-                'ffmpeg',
-                '-y',
-                '-i', temp_video_with_subs,
-                '-i', padded_audio_path,
-                '-c:v', 'copy',  # Copy video stream without re-encoding
-                '-c:a', 'aac',    # Encode audio to AAC
-                '-strict', 'experimental',
-                final_output_path
-            ]
-
-            self.logger.info(f"Muxing video, audio, and subtitles for segment {segment_index}...")
-            process_mux = subprocess.run(ffmpeg_mux_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-            if process_mux.returncode == 0:
-                self.logger.info(f"Successfully muxed video, audio, and subtitles into {final_output_path}")
-                # Optionally, remove the temporary video with subtitles and padded audio
-                os.remove(temp_video_with_subs)
-                self.logger.debug(f"Removed temporary video file: {temp_video_with_subs}")
-                if pad_duration > 0:
-                    os.remove(silence_path)
-                    self.logger.debug(f"Removed temporary silence file: {silence_path}")
-                    os.remove(padded_audio_path)
-                    self.logger.debug(f"Removed temporary padded audio file: {padded_audio_path}")
-                # Manage the final output folder
-                await self.manage_final_output_folder()
-            else:
-                self.logger.error(f"FFmpeg muxing failed for segment {segment_index}.")
-                self.logger.error(f"FFmpeg stderr: {process_mux.stderr}")
         except Exception as e:
-            self.logger.error(f"Error during FFmpeg muxing: {e}", exc_info=True)
-        finally:
-            # Clear subtitle_data_list for the segment
-            self.subtitle_data_list.clear()
+            self.logger.error(f"Error padding audio for segment {segment_index}: {e}")
+            return
+
+        # Mux Video, Audio, and Subtitles
+        try:
+            ffmpeg_mux_command = [
+                'ffmpeg', '-y', '-i', video_path, '-i', padded_audio_path,
+                '-vf', f"subtitles={subtitles_path}:force_style='FontSize=24,PrimaryColour=&HFFFFFF&'",
+                '-c:v', 'copy', '-c:a', 'aac', final_output_path
+            ]
+            process = subprocess.run(ffmpeg_mux_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            if process.returncode == 0:
+                self.logger.info(f"Successfully muxed segment {segment_index} to {final_output_path}.")
+            else:
+                self.logger.error(f"FFmpeg muxing failed for segment {segment_index}: {process.stderr}")
+        except Exception as e:
+            self.logger.error(f"Error during muxing for segment {segment_index}: {e}")
+
+
 
     async def heartbeat(self):
         """Send periodic heartbeat pings to keep the WebSocket connection alive."""
@@ -936,9 +873,10 @@ class OpenAIClient:
                     out.write(frame)
                     frame_count += 1
 
-                # Release the current segment video writer
+                # Release and prepare for the next segment
+                self.segment_start_time = time.perf_counter()
+                self.logger.info(f"Segment {self.segment_index} started at {self.segment_start_time}.")
                 out.release()
-                self.logger.info(f"Segment {self.segment_index} saved to {segment_output_path}.")
 
                 # Schedule muxing of video and audio in the asyncio loop
                 asyncio.run_coroutine_threadsafe(
