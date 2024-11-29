@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import base64
-from typing import Dict
+from typing import Optional
 import wave
 import numpy as np
 import simpleaudio as sa  # For playing audio locally
@@ -13,7 +13,6 @@ from asyncio import Queue
 from collections import deque
 import datetime
 import srt
-import errno
 from contextlib import suppress
 from pyAudioAnalysis import audioBasicIO
 from pyAudioAnalysis import ShortTermFeatures
@@ -22,11 +21,13 @@ import cv2  # Import OpenCV
 from logging.handlers import RotatingFileHandler
 import subprocess
 import signal
+import uuid
+
 
 class OpenAIClient:
     def __init__(self, api_key: str, loop: asyncio.AbstractEventLoop):
         self.api_key = api_key
-        self.ws = None
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.loop = loop  # Reference to the asyncio event loop
         self.setup_logging()
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -37,9 +38,9 @@ class OpenAIClient:
         # Initialize timestamp for audio chunks
         self.audio_timestamps = deque(maxlen=100)
 
-        self.video_start_time = None  # Will be set once when video processing starts
-        self.last_audio_sent_time = None
-        self.last_translated_audio_received_time = None
+        self.video_start_time: Optional[float] = None  # Will be set once when video processing starts
+        self.last_audio_sent_time: Optional[float] = None
+        self.last_translated_audio_received_time: Optional[float] = None
         self.processing_delays = []
         self.average_processing_delay = 0.0
 
@@ -118,7 +119,7 @@ class OpenAIClient:
         self.segment_start_time = None  # Start time of the current segment
 
         # Dictionary to store Wave_write objects for each segment
-        self.segment_audio_writers = {}
+        self.segment_audio_writers: Dict[int, wave.Wave_write] = {}
         self.segment_audio_lock = asyncio.Lock()
 
         # Initialize audio buffer (simple queue for sequential processing)
@@ -130,6 +131,7 @@ class OpenAIClient:
         logger.setLevel(logging.DEBUG)
 
         # Create rotating file handler for the main app log
+        os.makedirs('output/logs', exist_ok=True)
         app_handler = RotatingFileHandler("output/logs/app.log", maxBytes=5*1024*1024, backupCount=5)
         app_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         app_handler.setFormatter(app_formatter)
@@ -259,14 +261,8 @@ class OpenAIClient:
                         timestamp = time.perf_counter()
                         self.audio_timestamps.append(timestamp)
 
-                        base64_audio = base64.b64encode(data).decode('utf-8')
-                        append_event = {
-                            "type": "input_audio_buffer.append",
-                            "audio": base64_audio
-                            # Removed "sequence" as per the simplified approach
-                        }
-                        await self.enqueue_message(json.dumps(append_event))
-                        self.logger.info(f"Enqueued audio chunk of size: {len(base64_audio)} bytes")
+                        await self.send_input_audio_buffer_append(data)
+                        self.logger.info(f"Enqueued audio chunk of size: {len(data)} bytes")
 
                         await asyncio.sleep(0.05)  # Reduced sleep to minimize latency
             except Exception as e:
@@ -351,25 +347,7 @@ class OpenAIClient:
             raise
 
         # Configure session with translator instructions
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "model": "gpt-4o-realtime-preview-2024-10-01",
-                "modalities": ["text", "audio"],
-                "instructions": "You are a realtime translator. Please use the audio you receive and translate it into German. Try to match the tone, emotion, and duration of the original audio.",
-                "voice": "alloy",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 200
-                },
-                "temperature": 0.7
-            }
-        }
-        await self.enqueue_message(json.dumps(session_update))
+        await self.send_session_update()
         self.logger.info("Enqueued session.update message")
 
     async def safe_send(self, data: str):
@@ -447,8 +425,9 @@ class OpenAIClient:
                 response = await self.ws.recv()
                 event = json.loads(response)
                 event_type = event.get("type")
+                event_id = event.get("event_id")  # Not used anymore
 
-                self.logger.debug(f"Received event: {event_type}")
+                self.logger.debug(f"Received event: {event_type} with event_id: {event_id}")
 
                 if event_type == "input_audio_buffer.speech_started":
                     self.logger.info("Speech started")
@@ -490,7 +469,7 @@ class OpenAIClient:
 
                 elif event_type == "response.audio.delta":
                     audio_data = event.get("delta", "")
-                    # Removed sequence handling as API might not send sequence numbers
+                    # Directly associate with the current segment
                     if audio_data:
                         self.logger.info("Received audio delta")
                         self.last_translated_audio_received_time = time.perf_counter()
@@ -563,7 +542,7 @@ class OpenAIClient:
                 await self.reconnect()
                 continue
 
-    async def write_subtitle(self, index, start_time, end_time, text):
+    async def write_subtitle(self, index: int, start_time: float, end_time: float, text: str):
         """Write subtitle data directly to an SRT file for the current segment."""
         try:
             self.logger.debug(f"Writing subtitle {index}: '{text}' from {start_time} to {end_time}")
@@ -636,7 +615,7 @@ class OpenAIClient:
 
         return lines
 
-    async def overlay_subtitles_via_ffmpeg(self, video_path, subtitles_path):
+    async def overlay_subtitles_via_ffmpeg(self, video_path: str, subtitles_path: str) -> Optional[str]:
         """Overlay subtitles onto the video using FFmpeg and save as a new file."""
         try:
             # Define the path for the temporary video with subtitles
@@ -648,7 +627,7 @@ class OpenAIClient:
                 '-i', video_path,
                 '-vf', f"subtitles={subtitles_path}:force_style='FontSize=24,PrimaryColour=&HFFFFFF&'",
                 '-c:v', 'libx264',  # Re-encode video to ensure compatibility
-                '-c:a', 'copy',  # Copy the audio stream without re-encoding (no audio in video)
+                '-c:a', 'copy',      # Copy the audio stream without re-encoding (no audio in video)
                 temp_video_with_subs
             ]
 
@@ -706,6 +685,8 @@ class OpenAIClient:
             if wf:
                 wf.close()
                 self.logger.debug(f"Closed Wave_write object for segment {segment_index}")
+            else:
+                self.logger.error(f"No Wave_write object found for segment {segment_index}")
 
         # Define a temporary video file with subtitles
         temp_video_with_subs = f'output/video/output_video_segment_{segment_index}_temp.mp4'
@@ -1012,3 +993,49 @@ class OpenAIClient:
         """Placeholder for any future muxing tasks or workers."""
         while self.running:
             await asyncio.sleep(1)  # Currently no tasks, keep the coroutine alive.
+
+    async def send_input_audio_buffer_append(self, audio_data: bytes):
+        """Send input_audio_buffer.append event with a unique event_id."""
+        event_id = self.generate_event_id()
+        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+        input_audio_append_event = {
+            "event_id": event_id,
+            "type": "input_audio_buffer.append",
+            "audio": audio_base64
+        }
+        await self.enqueue_message(json.dumps(input_audio_append_event))
+        self.logger.debug(f"Enqueued input_audio_buffer.append event with event_id: {event_id}")
+        # Note: No mapping since server event_ids are different
+
+    async def send_session_update_with_event_id(self, event_id: str):
+        """Send a session.update event with a specific event_id."""
+        session_update_event = {
+            "event_id": event_id,
+            "type": "session.update",
+            "session": {
+                "model": "gpt-4o-realtime-preview-2024-10-01",
+                "modalities": ["text", "audio"],
+                "instructions": (
+                    "You are a realtime translator. "
+                    "Please use the audio you receive and translate it into German. "
+                    "Do not provide any additional responses or engage in conversations."
+                ),
+                "voice": "alloy",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500
+                },
+                "temperature": 0.7
+            }
+        }
+        await self.enqueue_message(json.dumps(session_update_event))
+        self.logger.debug(f"Enqueued session.update event with event_id: {event_id}")
+        # Note: No mapping since server event_ids are different
+
+    def generate_event_id(self) -> str:
+        """Generate a unique event ID."""
+        return str(uuid.uuid4())
