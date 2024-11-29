@@ -22,6 +22,8 @@ import cv2  # Import OpenCV
 from logging.handlers import RotatingFileHandler
 import subprocess
 import signal
+import uuid
+
 
 class OpenAIClient:
     def __init__(self, api_key: str, loop: asyncio.AbstractEventLoop):
@@ -69,6 +71,10 @@ class OpenAIClient:
         # Add a lock for reconnecting to prevent race conditions
         self.is_reconnecting = False
         self.reconnect_lock = asyncio.Lock()
+
+        # Initialize event ID mapping with asyncio.Lock for thread safety
+        self.event_id_mapping: Dict[str, int] = {}  # Maps event_id to segment_index
+        self.mapping_lock = asyncio.Lock()
 
         # Initialize WAV file for output (for verification)
         try:
@@ -118,11 +124,76 @@ class OpenAIClient:
         self.segment_start_time = None  # Start time of the current segment
 
         # Dictionary to store Wave_write objects for each segment
-        self.segment_audio_writers = {}
+        self.segment_audio_writers: Dict[int, wave.Wave_write] = {}
         self.segment_audio_lock = asyncio.Lock()
 
         # Initialize audio buffer (simple queue for sequential processing)
         self.audio_buffer = deque(maxlen=100)  # Adjust maxlen as needed
+
+    def map_event_to_segment(self, event_id: str, segment_index: int):
+        """Map an event_id to a segment_index in a thread-safe manner."""
+        async def _map():
+            async with self.mapping_lock:
+                self.event_id_mapping[event_id] = segment_index
+                self.logger.debug(f"Mapped event_id {event_id} to segment {segment_index}")
+        asyncio.create_task(_map())
+
+    async def get_segment_index(self, event_id: str) -> int:
+        """Retrieve the segment_index associated with an event_id."""
+        async with self.mapping_lock:
+            return self.event_id_mapping.get(event_id, None)
+
+    def generate_event_id(self) -> str:
+        """Generate a unique event ID."""
+        return str(uuid.uuid4())
+
+    async def send_input_audio_buffer_append(self, audio_data: bytes):
+        """Send input_audio_buffer.append event with a unique event_id."""
+        event_id = self.generate_event_id()
+        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+        input_audio_append_event = {
+            "event_id": event_id,
+            "type": "input_audio_buffer.append",
+            "audio": audio_base64
+        }
+        await self.enqueue_message(json.dumps(input_audio_append_event))
+        self.logger.debug(f"Enqueued input_audio_buffer.append event with event_id: {event_id}")
+        # Assuming each audio append corresponds to the current segment
+        await self.map_event_to_segment(event_id, self.segment_index)
+
+    async def send_session_update_with_event_id(self, event_id: str):
+        """Send a session.update event with a specific event_id."""
+        session_update_event = {
+            "event_id": event_id,
+            "type": "session.update",
+            "session": {
+                "model": "gpt-4o-realtime-preview-2024-10-01",
+                "modalities": ["text", "audio"],
+                "instructions": (
+                    "You are a realtime translator. "
+                    "Please use the audio you receive and translate it into German. "
+                    "Do not provide any additional responses or engage in conversations."
+                ),
+                "voice": "alloy",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500
+                },
+                "temperature": 0.7
+            }
+        }
+        await self.enqueue_message(json.dumps(session_update_event))
+        self.logger.debug(f"Enqueued session.update event with event_id: {event_id}")
+        # Optionally, map event_id to a specific segment if applicable
+
+    async def send_session_update(self):
+        """Send a session.update event with a unique event_id."""
+        event_id = self.generate_event_id()
+        await self.send_session_update_with_event_id(event_id)
 
     def setup_logging(self):
         """Setup logging with RotatingFileHandler to prevent log files from growing too large."""
@@ -130,6 +201,7 @@ class OpenAIClient:
         logger.setLevel(logging.DEBUG)
 
         # Create rotating file handler for the main app log
+        os.makedirs('output/logs', exist_ok=True)
         app_handler = RotatingFileHandler("output/logs/app.log", maxBytes=5*1024*1024, backupCount=5)
         app_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         app_handler.setFormatter(app_formatter)
@@ -259,14 +331,8 @@ class OpenAIClient:
                         timestamp = time.perf_counter()
                         self.audio_timestamps.append(timestamp)
 
-                        base64_audio = base64.b64encode(data).decode('utf-8')
-                        append_event = {
-                            "type": "input_audio_buffer.append",
-                            "audio": base64_audio
-                            # Removed "sequence" as per the simplified approach
-                        }
-                        await self.enqueue_message(json.dumps(append_event))
-                        self.logger.info(f"Enqueued audio chunk of size: {len(base64_audio)} bytes")
+                        await self.send_input_audio_buffer_append(data)
+                        self.logger.info(f"Enqueued audio chunk of size: {len(data)} bytes")
 
                         await asyncio.sleep(0.05)  # Reduced sleep to minimize latency
             except Exception as e:
@@ -350,27 +416,12 @@ class OpenAIClient:
             self.logger.error(f"Failed to connect to OpenAI Realtime API: {e}")
             raise
 
-        # Configure session with translator instructions
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "model": "gpt-4o-realtime-preview-2024-10-01",
-                "modalities": ["text", "audio"],
-                "instructions": "You are a realtime translator. Please use the audio you receive and translate it into German. Try to match the tone, emotion, and duration of the original audio.",
-                "voice": "alloy",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 200
-                },
-                "temperature": 0.7
-            }
-        }
-        await self.enqueue_message(json.dumps(session_update))
-        self.logger.info("Enqueued session.update message")
+        # Configure session with translator instructions using event_id
+        event_id = self.generate_event_id()
+        await self.send_session_update_with_event_id(event_id)
+        # Map the event_id to the current segment if applicable
+        await self.map_event_to_segment(event_id, self.segment_index)
+        self.logger.info("Enqueued session.update message with event_id.")
 
     async def safe_send(self, data: str):
         """Send data over WebSocket with error handling and reconnection"""
@@ -447,8 +498,9 @@ class OpenAIClient:
                 response = await self.ws.recv()
                 event = json.loads(response)
                 event_type = event.get("type")
+                event_id = event.get("event_id")
 
-                self.logger.debug(f"Received event: {event_type}")
+                self.logger.debug(f"Received event: {event_type} with event_id: {event_id}")
 
                 if event_type == "input_audio_buffer.speech_started":
                     self.logger.info("Speech started")
@@ -490,40 +542,48 @@ class OpenAIClient:
 
                 elif event_type == "response.audio.delta":
                     audio_data = event.get("delta", "")
-                    # Removed sequence handling as API might not send sequence numbers
-                    if audio_data:
-                        self.logger.info("Received audio delta")
-                        self.last_translated_audio_received_time = time.perf_counter()
+                    # Use event_id to map to segment_index
+                    if event_id:
+                        segment_index = await self.get_segment_index(event_id)
+                        if segment_index is None:
+                            self.logger.error(f"No segment found for event_id: {event_id}")
+                            return
 
-                        # Calculate processing delay if possible
-                        if self.last_audio_sent_time is not None:
-                            processing_delay = self.last_translated_audio_received_time - self.last_audio_sent_time
-                            self.processing_delays.append(processing_delay)
-                            self.logger.debug(f"Processing delay recorded: {processing_delay} seconds")
+                        if audio_data:
+                            self.logger.info("Received audio delta")
+                            self.last_translated_audio_received_time = time.perf_counter()
 
-                            # Update average processing delay
-                            if self.processing_delays:
-                                self.average_processing_delay = sum(self.processing_delays) / len(self.processing_delays)
-                                self.logger.debug(f"Updated average processing delay: {self.average_processing_delay} seconds")
-                        else:
-                            self.logger.warning("last_audio_sent_time is None. Cannot calculate processing delay.")
+                            # Calculate processing delay if possible
+                            if self.last_audio_sent_time is not None:
+                                processing_delay = self.last_translated_audio_received_time - self.last_audio_sent_time
+                                self.processing_delays.append(processing_delay)
+                                self.logger.debug(f"Processing delay recorded: {processing_delay} seconds")
 
-                        try:
-                            decoded_audio = base64.b64decode(audio_data)
-                            if len(decoded_audio) == 0:
-                                self.logger.warning("Decoded audio data is empty.")
+                                # Update average processing delay
+                                if self.processing_delays:
+                                    self.average_processing_delay = sum(self.processing_delays) / len(self.processing_delays)
+                                    self.logger.debug(f"Updated average processing delay: {self.average_processing_delay} seconds")
                             else:
-                                self.logger.debug(f"Decoded audio data: {len(decoded_audio)} bytes")
+                                self.logger.warning("last_audio_sent_time is None. Cannot calculate processing delay.")
 
-                            # Calculate the start time for this audio chunk
-                            start_time = time.perf_counter()
+                            try:
+                                decoded_audio = base64.b64decode(audio_data)
+                                if len(decoded_audio) == 0:
+                                    self.logger.warning("Decoded audio data is empty.")
+                                else:
+                                    self.logger.debug(f"Decoded audio data: {len(decoded_audio)} bytes")
 
-                            await self.enqueue_audio(decoded_audio, start_time)
-                            self.logger.debug("Processed translated audio chunk.")
-                        except Exception as e:
-                            self.logger.error(f"Error handling audio data: {e}", exc_info=True)
+                                # Calculate the start time for this audio chunk
+                                start_time = time.perf_counter()
+
+                                await self.enqueue_audio(decoded_audio, start_time)
+                                self.logger.debug("Processed translated audio chunk.")
+                            except Exception as e:
+                                self.logger.error(f"Error handling audio data: {e}", exc_info=True)
+                        else:
+                            self.logger.debug("Received empty audio delta.")
                     else:
-                        self.logger.debug("Received empty audio delta.")
+                        self.logger.error("Received audio delta without event_id.")
 
                 elif event_type == "response.audio_transcript.delta":
                     text = event.get("delta", "")
@@ -648,10 +708,9 @@ class OpenAIClient:
                 '-i', video_path,
                 '-vf', f"subtitles={subtitles_path}:force_style='FontSize=24,PrimaryColour=&HFFFFFF&'",
                 '-c:v', 'libx264',  # Re-encode video to ensure compatibility
-                '-c:a', 'copy',  # Copy the audio stream without re-encoding (no audio in video)
+                '-c:a', 'copy',      # Copy the audio stream without re-encoding (no audio in video)
                 temp_video_with_subs
             ]
-
             self.logger.info(f"Overlaying subtitles onto video {video_path}...")
             process = subprocess.run(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -706,6 +765,8 @@ class OpenAIClient:
             if wf:
                 wf.close()
                 self.logger.debug(f"Closed Wave_write object for segment {segment_index}")
+            else:
+                self.logger.error(f"No Wave_write object found for segment {segment_index}")
 
         # Define a temporary video file with subtitles
         temp_video_with_subs = f'output/video/output_video_segment_{segment_index}_temp.mp4'
