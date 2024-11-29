@@ -32,6 +32,7 @@ class OpenAIClient:
         self.setup_logging()
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.info("OpenAIClient initialized.")
+        self.outgoing_requests = {}
 
         self.running = True  # Initialize the running flag
 
@@ -114,7 +115,7 @@ class OpenAIClient:
         self.total_frames = 0  # Total number of audio frames processed
 
         # Set segment duration for video splitting (e.g., 5 seconds)
-        self.segment_duration = 5  # in seconds
+        self.segment_duration = 10  # in seconds
         self.segment_index = 1  # To keep track of video segments
         self.segment_start_time = None  # Start time of the current segment
 
@@ -408,8 +409,8 @@ class OpenAIClient:
             "response": {
                 "modalities": ["text", "audio"],
                 "instructions": (
-                    "Please translate the audio you receive into German. "
-                    "Try to keep the original tone and emotion. "
+                    "You are a real-time tranlator. Please translate the audio you receive into German. "
+                    "Try to keep the original tone, emotion and intonation. "
                     "Adjust the voice to match the original speaker's gender."
                 ),
                 "voice": selected_voice
@@ -428,6 +429,9 @@ class OpenAIClient:
                 event_id = event.get("event_id")  # Not used anymore
 
                 self.logger.debug(f"Received event: {event_type} with event_id: {event_id}")
+
+                if event_type.startswith("response.") and not event_type.startswith("response.audio"):
+                    self.logger.warning(f"Unexpected assistant behavior for event {event_type}: {event}")
 
                 if event_type == "input_audio_buffer.speech_started":
                     self.logger.info("Speech started")
@@ -469,6 +473,7 @@ class OpenAIClient:
 
                 elif event_type == "response.audio.delta":
                     audio_data = event.get("delta", "")
+                    event_id = event.get("event_id")
                     # Directly associate with the current segment
                     if audio_data:
                         self.logger.info("Received audio delta")
@@ -489,16 +494,21 @@ class OpenAIClient:
 
                         try:
                             decoded_audio = base64.b64decode(audio_data)
+                            request_info = self.outgoing_requests[event_id] = {
+                                "type": "input_audio_buffer.append",
+                                "timestamp": time.perf_counter()
+                            }
+                            start_time = request_info.get("timestamp", time.perf_counter())
+
                             if len(decoded_audio) == 0:
                                 self.logger.warning("Decoded audio data is empty.")
                             else:
                                 self.logger.debug(f"Decoded audio data: {len(decoded_audio)} bytes")
 
                             # Calculate the start time for this audio chunk
-                            start_time = time.perf_counter()
 
                             await self.enqueue_audio(decoded_audio, start_time)
-                            self.logger.debug("Processed translated audio chunk.")
+                            self.logger.debug(f"Processed audio delta for event_id: {event_id}")
                         except Exception as e:
                             self.logger.error(f"Error handling audio data: {e}", exc_info=True)
                     else:
@@ -506,14 +516,13 @@ class OpenAIClient:
 
                 elif event_type == "response.audio_transcript.delta":
                     text = event.get("delta", "")
-                    if text.strip():
-                        self.logger.info(f"Translated text received: {text}")
-                        # Accumulate subtitle text
+                    if text:
                         self.current_subtitle += text
-                        self.logger.debug(f"Accumulated subtitle text: '{self.current_subtitle}'")
+                        self.logger.debug(f"Accumulating subtitle for event_id {event_id}: {text}")
                     else:
                         self.logger.debug("Received empty transcript delta.")
                         self.logger.debug(f"Accumulated subtitle text: {self.current_subtitle}")
+                        
 
                 elif event_type in [
                     "response.audio.done",
@@ -1005,36 +1014,31 @@ class OpenAIClient:
         }
         await self.enqueue_message(json.dumps(input_audio_append_event))
         self.logger.debug(f"Enqueued input_audio_buffer.append event with event_id: {event_id}")
-        # Note: No mapping since server event_ids are different
+        # Track outgoing request by event_id
+        self.outgoing_requests[event_id] = {"type": "input_audio_buffer.append", "timestamp": time.perf_counter()}
 
-    async def send_session_update_with_event_id(self, event_id: str):
-        """Send a session.update event with a specific event_id."""
+
+    async def send_session_update(self):
+        """Send session.update event to enforce translation instructions."""
+        event_id = self.generate_event_id()
         session_update_event = {
             "event_id": event_id,
             "type": "session.update",
             "session": {
-                "model": "gpt-4o-realtime-preview-2024-10-01",
-                "modalities": ["text", "audio"],
                 "instructions": (
-                    "You are a realtime translator. "
-                    "Please use the audio you receive and translate it into German. "
-                    "Do not provide any additional responses or engage in conversations."
+                    "You are a real-time translator. Translate the audio you receive into German. "
+                    "Do not respond conversationally."
                 ),
+                "modalities": ["text", "audio"],
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500
-                },
                 "temperature": 0.7
             }
         }
         await self.enqueue_message(json.dumps(session_update_event))
-        self.logger.debug(f"Enqueued session.update event with event_id: {event_id}")
-        # Note: No mapping since server event_ids are different
+        self.logger.info(f"Enforced strict translation instructions with event_id: {event_id}")
+
 
     def generate_event_id(self) -> str:
         """Generate a unique event ID."""
