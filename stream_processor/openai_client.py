@@ -485,6 +485,16 @@ class OpenAIClient:
                     self.logger.debug("Audio buffer committed.")
                     self.last_audio_sent_time = time.time()
 
+                elif event_type == "error":
+                    error_code = event.get("code", "No error code provided.")
+                    if error_code in ["authentication_error", "invalid_api_key"]:
+                        self.logger.error("Authentication failed. Please check your API key.")
+                        # Optionally, trigger a shutdown or alert
+                    else:
+                        error_message = event.get("message", "No error message provided.")
+                        self.logger.error(f"Received error event: {error_code} - {error_message}")
+
+
                 elif event_type == "response.audio.delta":
                     audio_data = event.get("delta", "")
                     if audio_data:
