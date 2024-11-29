@@ -10,7 +10,7 @@ import wave
 import numpy as np
 import simpleaudio as sa  # For playing audio locally
 from asyncio import Queue
-from collections import defaultdict
+from collections import deque
 import datetime
 import srt
 import errno
@@ -34,15 +34,14 @@ class OpenAIClient:
 
         self.running = True  # Initialize the running flag
 
-        self.input_audio_timestamps = []
+        # Initialize timestamp for audio chunks
+        self.audio_timestamps = deque(maxlen=100)
+
         self.video_start_time = None  # Will be set once when video processing starts
         self.last_audio_sent_time = None
         self.last_translated_audio_received_time = None
         self.processing_delays = []
         self.average_processing_delay = 0.0
-
-        self.websocket_clients: Dict[int, websockets.WebSocketServerProtocol] = {}
-        self.next_client_id = 1  # To assign unique IDs to clients
 
         # Define stream URL (Replace with your actual stream URL)
         self.stream_url = 'https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t'
@@ -60,13 +59,9 @@ class OpenAIClient:
         self.transcript_file = open(os.path.join(transcript_dir, 'transcript.txt'), 'w', encoding='utf-8')
         self.audio_counter = 0
 
-        # Initialize playback buffer
-        self.playback_buffer = defaultdict(bytes)  # Buffer to store out-of-order chunks
-        self.playback_sequence = 0  # Expected sequence number for playback
+        # Initialize playback buffer using deque
+        self.playback_buffer = deque(maxlen=100)  # Adjust maxlen as needed
         self.playback_event = asyncio.Event()  # Event to signal available audio
-
-        # Initialize a separate sequence counter for audio chunks
-        self.audio_sequence = 0  # Tracks the next expected audio sequence number
 
         # Create task for playback
         self.playback_task = asyncio.create_task(self.audio_playback_handler())
@@ -117,7 +112,7 @@ class OpenAIClient:
         # Initialize total frames
         self.total_frames = 0  # Total number of audio frames processed
 
-        # Set segment duration for video splitting (e.g., 30 seconds)
+        # Set segment duration for video splitting (e.g., 5 seconds)
         self.segment_duration = 5  # in seconds
         self.segment_index = 1  # To keep track of video segments
         self.segment_start_time = None  # Start time of the current segment
@@ -126,8 +121,8 @@ class OpenAIClient:
         self.segment_audio_writers = {}
         self.segment_audio_lock = asyncio.Lock()
 
-        # Create and ensure the existence of output directories
-        self.create_directories()
+        # Initialize audio buffer (simple queue for sequential processing)
+        self.audio_buffer = deque(maxlen=100)  # Adjust maxlen as needed
 
     def setup_logging(self):
         """Setup logging with RotatingFileHandler to prevent log files from growing too large."""
@@ -250,27 +245,30 @@ class OpenAIClient:
         self.logger.info("Starting to read from input_audio_pipe")
         while self.running:
             try:
+                # Open the named pipe in binary read mode
                 async with aiofiles.open(self.input_audio_pipe, 'rb') as pipe:
                     while self.running:
-                        data = await pipe.read(32768)  # Read 32KB
+                        data = await pipe.read(65536)  # Increased buffer size to 64KB
                         if not data:
                             self.logger.debug('No audio data available')
-                            await asyncio.sleep(0.1)
+                            await asyncio.sleep(0.05)  # Further reduced sleep
                             continue
                         self.latest_input_audio = data  # Store for gender detection
 
                         # Record the timestamp when the audio chunk is read
-                        timestamp = time.time()
-                        self.input_audio_timestamps.append(timestamp)
+                        timestamp = time.perf_counter()
+                        self.audio_timestamps.append(timestamp)
 
                         base64_audio = base64.b64encode(data).decode('utf-8')
                         append_event = {
                             "type": "input_audio_buffer.append",
                             "audio": base64_audio
+                            # Removed "sequence" as per the simplified approach
                         }
                         await self.enqueue_message(json.dumps(append_event))
                         self.logger.info(f"Enqueued audio chunk of size: {len(base64_audio)} bytes")
-                        await asyncio.sleep(0.1)  # Prevent flooding
+
+                        await asyncio.sleep(0.05)  # Reduced sleep to minimize latency
             except Exception as e:
                 self.logger.error(f"Error in read_input_audio: {e}", exc_info=True)
                 await asyncio.sleep(1)  # Prevent tight loop on error
@@ -280,19 +278,17 @@ class OpenAIClient:
         while self.running:
             try:
                 await self.playback_event.wait()
-                while self.playback_sequence in self.playback_buffer:
-                    audio_data, start_time = self.playback_buffer.pop(self.playback_sequence)
-                    self.logger.debug(f"Processing audio chunk: {self.playback_sequence}")
-                    await self.process_playback_chunk(self.playback_sequence, audio_data, start_time)
-                    self.playback_sequence += 1
-                    self.logger.debug(f"Processed audio chunk: {self.playback_sequence - 1}")
+                while self.audio_buffer:
+                    audio_data, start_time = self.audio_buffer.popleft()
+                    self.logger.debug(f"Processing audio chunk.")
+                    await self.process_playback_chunk(audio_data, start_time)
                 self.playback_event.clear()
             except Exception as e:
                 self.logger.error(f"Error in audio_playback_handler: {e}", exc_info=True)
                 await asyncio.sleep(1)
                 continue
 
-    async def process_playback_chunk(self, sequence: int, audio_data: bytes, start_time: float):
+    async def process_playback_chunk(self, audio_data: bytes, start_time: float):
         """Process and play a single translated audio chunk for playback and save to WAV"""
         try:
             # Calculate delay to synchronize with video start time
@@ -300,9 +296,10 @@ class OpenAIClient:
                 self.logger.warning("Video start time is not initialized.")
                 return
 
-            # Calculate the expected playback time
-            expected_playback_time = self.video_start_time + (start_time - self.video_start_time)
-            current_time = time.time()
+            # Calculate the expected playback time relative to video start
+            elapsed_time = start_time - self.video_start_time
+            expected_playback_time = self.video_start_time + elapsed_time
+            current_time = time.perf_counter()
             delay = expected_playback_time - current_time
             if delay > 0:
                 self.logger.debug(f"Delaying audio playback for {delay:.3f} seconds to synchronize with video.")
@@ -312,29 +309,29 @@ class OpenAIClient:
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
             play_obj = sa.play_buffer(audio_array, 1, 2, 24000)
             await asyncio.to_thread(play_obj.wait_done)
-            self.logger.debug(f"Played translated audio chunk: {sequence}")
+            self.logger.debug("Played translated audio chunk.")
 
             # Write to the output WAV file
             if self.output_wav:
                 self.output_wav.writeframes(audio_data)
-                self.logger.debug(f"Written translated audio chunk {sequence} to WAV file")
+                self.logger.debug("Written translated audio chunk to WAV file.")
 
             # Write to the corresponding per-segment audio WAV file
             async with self.segment_audio_lock:
                 wf = self.segment_audio_writers.get(self.segment_index)
                 if wf:
                     wf.writeframes(audio_data)
-                    self.logger.debug(f"Written translated audio chunk {sequence} to segment {self.segment_index} WAV file")
+                    self.logger.debug(f"Written translated audio chunk to segment {self.segment_index} WAV file.")
                 else:
                     self.logger.error(f"No Wave_write object found for segment {self.segment_index}")
 
         except Exception as e:
-            self.logger.error(f"Error processing playback chunk {sequence}: {e}", exc_info=True)
+            self.logger.error(f"Error processing playback chunk: {e}", exc_info=True)
 
-    async def enqueue_audio(self, sequence: int, audio_data: bytes, start_time: float):
-        """Enqueue translated audio data with its sequence number and start time into playback buffer"""
-        self.logger.debug(f"Received audio chunk {sequence}, buffering.")
-        self.playback_buffer[sequence] = (audio_data, start_time)
+    async def enqueue_audio(self, audio_data: bytes, start_time: float):
+        """Enqueue translated audio data with its start time into playback buffer"""
+        self.logger.debug("Received audio chunk, buffering.")
+        self.audio_buffer.append((audio_data, start_time))
 
         # Signal the playback handler
         self.playback_event.set()
@@ -455,12 +452,12 @@ class OpenAIClient:
 
                 if event_type == "input_audio_buffer.speech_started":
                     self.logger.info("Speech started")
-                    self.speech_start_time = time.time()
+                    self.speech_start_time = time.perf_counter()
                     self.logger.debug(f"Speech started at time: {self.speech_start_time}")
 
                 elif event_type == "input_audio_buffer.speech_stopped":
                     self.logger.info("Speech stopped")
-                    speech_end_time = time.time()
+                    speech_end_time = time.perf_counter()
 
                     # Ensure that there is subtitle text and start time before writing
                     if self.current_subtitle.strip() and self.speech_start_time is not None:
@@ -482,7 +479,7 @@ class OpenAIClient:
                     # Commit the audio buffer and create a response
                     await self.commit_audio_buffer()
                     self.logger.debug("Audio buffer committed.")
-                    self.last_audio_sent_time = time.time()
+                    self.last_audio_sent_time = time.perf_counter()
 
                     # Detect gender and create response with appropriate voice
                     gender = self.detect_gender(self.latest_input_audio)
@@ -493,11 +490,12 @@ class OpenAIClient:
 
                 elif event_type == "response.audio.delta":
                     audio_data = event.get("delta", "")
+                    # Removed sequence handling as API might not send sequence numbers
                     if audio_data:
                         self.logger.info("Received audio delta")
-                        self.last_translated_audio_received_time = time.time()
+                        self.last_translated_audio_received_time = time.perf_counter()
 
-                        # Ensure last_audio_sent_time is set before calculating delay
+                        # Calculate processing delay if possible
                         if self.last_audio_sent_time is not None:
                             processing_delay = self.last_translated_audio_received_time - self.last_audio_sent_time
                             self.processing_delays.append(processing_delay)
@@ -513,15 +511,15 @@ class OpenAIClient:
                         try:
                             decoded_audio = base64.b64decode(audio_data)
                             if len(decoded_audio) == 0:
-                                self.logger.warning(f"Decoded audio data is empty for sequence {self.audio_sequence}")
+                                self.logger.warning("Decoded audio data is empty.")
                             else:
-                                self.logger.debug(f"Decoded audio data for sequence {self.audio_sequence}: {len(decoded_audio)} bytes")
-                            sequence = self.audio_sequence  # Assign current sequence number
+                                self.logger.debug(f"Decoded audio data: {len(decoded_audio)} bytes")
+
                             # Calculate the start time for this audio chunk
-                            start_time = time.time()
-                            await self.enqueue_audio(sequence, decoded_audio, start_time)
-                            self.audio_sequence += 1  # Increment for the next chunk
-                            self.logger.debug(f"Processed translated audio chunk: {sequence}")
+                            start_time = time.perf_counter()
+
+                            await self.enqueue_audio(decoded_audio, start_time)
+                            self.logger.debug("Processed translated audio chunk.")
                         except Exception as e:
                             self.logger.error(f"Error handling audio data: {e}", exc_info=True)
                     else:
@@ -556,8 +554,12 @@ class OpenAIClient:
             except websockets.exceptions.ConnectionClosedError as e:
                 self.logger.error(f"WebSocket connection closed with error: {e}")
                 await self.reconnect()
+            except json.JSONDecodeError as e:
+                self.logger.error(f"JSON decode error: {e} for response: {response}")
+            except KeyError as e:
+                self.logger.error(f"Missing key in response: {e} for response: {response}")
             except Exception as e:
-                self.logger.error(f"Error in handle_responses: {e}", exc_info=True)
+                self.logger.error(f"Unexpected error in handle_responses: {e}", exc_info=True)
                 await self.reconnect()
                 continue
 
@@ -645,7 +647,8 @@ class OpenAIClient:
                 '-y',
                 '-i', video_path,
                 '-vf', f"subtitles={subtitles_path}:force_style='FontSize=24,PrimaryColour=&HFFFFFF&'",
-                '-c:a', 'copy',  # Copy the audio stream without re-encoding
+                '-c:v', 'libx264',  # Re-encode video to ensure compatibility
+                '-c:a', 'copy',  # Copy the audio stream without re-encoding (no audio in video)
                 temp_video_with_subs
             ]
 
@@ -686,7 +689,7 @@ class OpenAIClient:
         video_path = f'output/video/output_video_segment_{segment_index}.mp4'
         audio_path = f'output/audio/output_audio_segment_{segment_index}.wav'
         subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
-        final_output_path = f'output/video/output_video_segment_{segment_index}.mp4'  # Save in output/video
+        final_output_path = f'output/final/output_final_video_segment_{segment_index}.mp4'  # Save in output/final
 
         # Check if video, audio, and subtitles files exist
         missing_files = []
@@ -696,6 +699,13 @@ class OpenAIClient:
         if missing_files:
             self.logger.error(f"Missing files for muxing: {missing_files}. Cannot mux.")
             return
+
+        # **Critical Fix:** Close the Wave_write object before muxing
+        async with self.segment_audio_lock:
+            wf = self.segment_audio_writers.pop(segment_index, None)
+            if wf:
+                wf.close()
+                self.logger.debug(f"Closed Wave_write object for segment {segment_index}")
 
         # Define a temporary video file with subtitles
         temp_video_with_subs = f'output/video/output_video_segment_{segment_index}_temp.mp4'
@@ -707,7 +717,7 @@ class OpenAIClient:
             '-i', video_path,
             '-vf', f"subtitles={subtitles_path}:force_style='FontSize=24,PrimaryColour=&HFFFFFF&'",
             '-c:v', 'libx264',  # Re-encode video to ensure compatibility
-            '-c:a', 'copy',
+            '-c:a', 'copy',      # No audio in video
             temp_video_with_subs
         ]
 
@@ -720,14 +730,66 @@ class OpenAIClient:
                 self.logger.error(f"FFmpeg stderr: {process_subs.stderr}")
                 return
 
-            # FFmpeg command to mux video with subtitles and audio
+            # **New Step:** Calculate padding duration and pad audio if necessary
+            # Open the audio WAV file to get its duration
+            with wave.open(audio_path, 'rb') as wf_audio:
+                num_frames = wf_audio.getnframes()
+                framerate = wf_audio.getframerate()
+                audio_duration = num_frames / float(framerate)
+
+            required_duration = self.segment_duration
+            pad_duration = required_duration - audio_duration
+
+            if pad_duration > 0:
+                self.logger.debug(f"Padding audio with {pad_duration:.3f} seconds of silence.")
+
+                # Generate silence audio using FFmpeg
+                silence_path = f'output/audio/silence_segment_{segment_index}.wav'
+                ffmpeg_silence_command = [
+                    'ffmpeg',
+                    '-y',
+                    '-f', 'lavfi',
+                    '-i', f'anullsrc=r={framerate}:cl=mono',
+                    '-t', f'{pad_duration:.3f}',
+                    '-c:a', 'pcm_s16le',
+                    silence_path
+                ]
+                process_silence = subprocess.run(ffmpeg_silence_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+                if process_silence.returncode != 0:
+                    self.logger.error(f"FFmpeg failed to generate silence for segment {segment_index}.")
+                    self.logger.error(f"FFmpeg stderr: {process_silence.stderr}")
+                    return
+
+                # Concatenate original audio with silence
+                padded_audio_path = f'output/audio/output_audio_segment_{segment_index}_padded.wav'
+                ffmpeg_concat_command = [
+                    'ffmpeg',
+                    '-y',
+                    '-i', audio_path,
+                    '-i', silence_path,
+                    '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1[a]',
+                    '-map', '[a]',
+                    '-c:a', 'pcm_s16le',
+                    padded_audio_path
+                ]
+                process_concat = subprocess.run(ffmpeg_concat_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+                if process_concat.returncode != 0:
+                    self.logger.error(f"FFmpeg failed to concatenate audio and silence for segment {segment_index}.")
+                    self.logger.error(f"FFmpeg stderr: {process_concat.stderr}")
+                    return
+            else:
+                padded_audio_path = audio_path  # No padding needed
+
+            # FFmpeg command to mux video with padded audio
             ffmpeg_mux_command = [
                 'ffmpeg',
                 '-y',
                 '-i', temp_video_with_subs,
-                '-i', audio_path,
+                '-i', padded_audio_path,
                 '-c:v', 'copy',  # Copy video stream without re-encoding
-                '-c:a', 'aac',   # Encode audio to AAC
+                '-c:a', 'aac',    # Encode audio to AAC
                 '-strict', 'experimental',
                 final_output_path
             ]
@@ -737,9 +799,14 @@ class OpenAIClient:
 
             if process_mux.returncode == 0:
                 self.logger.info(f"Successfully muxed video, audio, and subtitles into {final_output_path}")
-                # Optionally, remove the temporary video with subtitles
+                # Optionally, remove the temporary video with subtitles and padded audio
                 os.remove(temp_video_with_subs)
                 self.logger.debug(f"Removed temporary video file: {temp_video_with_subs}")
+                if pad_duration > 0:
+                    os.remove(silence_path)
+                    self.logger.debug(f"Removed temporary silence file: {silence_path}")
+                    os.remove(padded_audio_path)
+                    self.logger.debug(f"Removed temporary padded audio file: {padded_audio_path}")
                 # Manage the final output folder
                 await self.manage_final_output_folder()
             else:
@@ -748,13 +815,6 @@ class OpenAIClient:
         except Exception as e:
             self.logger.error(f"Error during FFmpeg muxing: {e}", exc_info=True)
         finally:
-            # Close the corresponding Wave_write object
-            async with self.segment_audio_lock:
-                wf = self.segment_audio_writers.pop(segment_index, None)
-                if wf:
-                    wf.close()
-                    self.logger.debug(f"Closed Wave_write object for segment {segment_index}")
-
             # Clear subtitle_data_list for the segment
             self.subtitle_data_list.clear()
 
@@ -844,7 +904,7 @@ class OpenAIClient:
             # Initialize variables for video segmentation
             segment_frames = int(fps * self.segment_duration)
             frame_count = 0
-            self.segment_start_time = time.time()
+            self.segment_start_time = time.perf_counter()
             if self.video_start_time is None:
                 self.video_start_time = self.segment_start_time  # Set video_start_time for synchronization
 
@@ -873,17 +933,14 @@ class OpenAIClient:
                 except Exception as e:
                     self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
 
+                # Reset subtitle data for the new segment
+                self.subtitle_data_list.clear()
+
                 while frame_count < segment_frames and self.running:
                     ret, frame = cap.read()
                     if not ret:
                         self.logger.warning("Failed to read frame from video stream.")
                         break
-
-                    # Get current time relative to video start
-                    current_time = time.time() - self.video_start_time
-
-                    # Note: Removed OpenCV's overlay_subtitles to handle subtitles via FFmpeg
-                    # self.overlay_subtitles(frame, current_time)
 
                     # Write frame to output video
                     out.write(frame)
@@ -893,16 +950,16 @@ class OpenAIClient:
                 out.release()
                 self.logger.info(f"Segment {self.segment_index} saved to {segment_output_path}.")
 
+                # Schedule muxing of video and audio in the asyncio loop
+                asyncio.run_coroutine_threadsafe(
+                    self.mux_video_audio(self.segment_index),
+                    self.loop
+                )
+
                 # Reset for next segment
                 self.segment_index += 1
                 frame_count = 0
-                self.segment_start_time = time.time()
-
-                # Schedule muxing of video and audio in the asyncio loop
-                asyncio.run_coroutine_threadsafe(
-                    self.mux_video_audio(self.segment_index - 1),
-                    self.loop
-                )
+                self.segment_start_time = time.perf_counter()
 
         except Exception as e:
             self.logger.error(f"Error in start_video_processing: {e}", exc_info=True)
@@ -912,7 +969,11 @@ class OpenAIClient:
         """Run the OpenAIClient."""
         # Handle graceful shutdown on signals
         for sig in (signal.SIGINT, signal.SIGTERM):
-            self.loop.add_signal_handler(sig, lambda sig=sig: asyncio.create_task(self.shutdown(sig)))
+            try:
+                self.loop.add_signal_handler(sig, lambda sig=sig: asyncio.create_task(self.shutdown(sig)))
+            except NotImplementedError:
+                # Signal handling might not be implemented on some platforms (e.g., Windows)
+                self.logger.warning(f"Signal handling not supported on this platform.")
 
         # Start video processing
         video_processing_task = asyncio.create_task(self.run_video_processing())
