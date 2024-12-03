@@ -53,6 +53,9 @@ class OpenAIClient:
         # Create directories for output if they don't exist
         self.create_directories()
 
+        # Clear previous subtitles to prevent accumulation
+        self.clear_subtitles_file()
+
         # Create named pipe for input audio
         self.input_audio_pipe = os.path.abspath('input_audio_pipe')
         self.create_named_pipe(self.input_audio_pipe)
@@ -92,8 +95,6 @@ class OpenAIClient:
         self.current_subtitle = ""
         self.speech_start_time = None  # Time when current speech starts
 
-        self.subtitle_data_list = []  # Store all subtitles with timing
-
         # Initialize the send queue
         self.send_queue = Queue()
         self.send_task = asyncio.create_task(self.send_messages())
@@ -130,6 +131,22 @@ class OpenAIClient:
 
         # Initialize delay benchmarking
         self.setup_delay_benchmarking()
+
+        # Initialize a queue to track sent audio chunks for FIFO mapping
+        self.sent_audio_queue = deque()
+
+        # Initialize a single SRT file for all subtitles
+        self.srt_output_path = 'output/subtitles/subtitles.srt'
+        asyncio.create_task(self.initialize_srt_file())
+
+    async def initialize_srt_file(self):
+        """Initialize the single SRT file by clearing any existing content."""
+        try:
+            async with aiofiles.open(self.srt_output_path, 'w', encoding='utf-8') as f:
+                await f.write("")  # Clear the file
+            self.logger.info(f"Initialized (cleared) SRT file at {self.srt_output_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize SRT file: {e}", exc_info=True)
 
     def setup_logging(self):
         """Setup logging with RotatingFileHandler to prevent log files from growing too large."""
@@ -215,6 +232,16 @@ class OpenAIClient:
                 self.logger.debug(f"Ensured directory exists: {directory}")
             except Exception as e:
                 self.logger.error(f"Failed to create directory {directory}: {e}", exc_info=True)
+
+    def clear_subtitles_file(self):
+        """Clear the existing SRT file to prevent accumulation."""
+        try:
+            if os.path.exists(self.srt_output_path):
+                os.remove(self.srt_output_path)
+                self.logger.debug(f"Removed existing SRT file: {self.srt_output_path}")
+            self.logger.info("Cleared existing subtitles.")
+        except Exception as e:
+            self.logger.error(f"Failed to clear subtitles file: {e}", exc_info=True)
 
     def create_named_pipe(self, pipe_name):
         """
@@ -530,15 +557,17 @@ class OpenAIClient:
 
                 elif event_type == "response.audio.delta":
                     audio_data = event.get("delta", "")
-                    event_id = event.get("event_id")
-                    # Directly associate with the current segment
+                    # event_id is no longer used for mapping
+
+                    # Directly associate with the first audio chunk in the queue
                     if audio_data:
                         self.logger.info("Received audio delta")
                         self.last_translated_audio_received_time = time.perf_counter()
 
                         # Calculate processing delay if possible
-                        if self.last_audio_sent_time is not None:
-                            processing_delay = self.last_translated_audio_received_time - self.last_audio_sent_time
+                        if self.sent_audio_queue:
+                            sent_timestamp = self.sent_audio_queue.popleft()
+                            processing_delay = self.last_translated_audio_received_time - sent_timestamp
                             self.processing_delays.append(processing_delay)
                             self.logger.debug(f"Processing delay recorded: {processing_delay} seconds")
 
@@ -546,30 +575,29 @@ class OpenAIClient:
                             if self.processing_delays:
                                 self.average_processing_delay = sum(self.processing_delays) / len(self.processing_delays)
                                 self.logger.debug(f"Updated average processing delay: {self.average_processing_delay} seconds")
-                            
+
                             # Log delay metrics for benchmarking
                             self.log_delay_metrics()
                         else:
-                            self.logger.warning("last_audio_sent_time is None. Cannot calculate processing delay.")
+                            self.logger.warning("No corresponding sent audio chunk for received audio delta. Cannot calculate processing delay.")
 
                         try:
                             decoded_audio = base64.b64decode(audio_data)
-                            # Ensure event_id exists in outgoing_requests
-                            if event_id in self.outgoing_requests:
-                                request_info = self.outgoing_requests[event_id]
-                                start_time = request_info.get("timestamp", time.perf_counter())
-                            else:
-                                self.logger.warning(f"Received response for unknown event_id: {event_id}")
-                                start_time = time.perf_counter()  # Fallback to current time
-
                             if len(decoded_audio) == 0:
                                 self.logger.warning("Decoded audio data is empty.")
                             else:
                                 self.logger.debug(f"Decoded audio data: {len(decoded_audio)} bytes")
 
-                            # Calculate the start time for this audio chunk
-                            await self.enqueue_audio(decoded_audio, start_time)
-                            self.logger.debug(f"Processed audio delta for event_id: {event_id}")
+                            # Calculate the start time for this audio chunk based on processing delays
+                            # Estimate the start time relative to video_start_time
+                            if self.processing_delays:
+                                # Estimate based on average processing delay
+                                estimated_start_time = self.video_start_time + (len(self.processing_delays) * self.segment_duration) - self.average_processing_delay
+                            else:
+                                estimated_start_time = self.video_start_time
+
+                            await self.enqueue_audio(decoded_audio, estimated_start_time)
+                            self.logger.debug(f"Processed audio delta.")
                         except Exception as e:
                             self.logger.error(f"Error handling audio data: {e}", exc_info=True)
                     else:
@@ -579,7 +607,7 @@ class OpenAIClient:
                     text = event.get("delta", "")
                     if text:
                         self.current_subtitle += text
-                        self.logger.debug(f"Accumulating subtitle for event_id {event_id}: {text}")
+                        self.logger.debug(f"Accumulating subtitle: {text}")
                     else:
                         self.logger.debug("Received empty transcript delta.")
                         self.logger.debug(f"Accumulated subtitle text: {self.current_subtitle}")
@@ -612,7 +640,7 @@ class OpenAIClient:
                 continue
 
     async def write_subtitle(self, index: int, start_time: float, end_time: float, text: str):
-        """Write subtitle data directly to an SRT file for the current segment."""
+        """Write subtitle data directly to a single SRT file."""
         try:
             self.logger.debug(f"Writing subtitle {index}: '{text}' from {start_time} to {end_time}")
 
@@ -643,18 +671,13 @@ class OpenAIClient:
                 sub_start = datetime.timedelta(seconds=adjusted_start_time + i * duration_per_subtitle)
                 sub_end = datetime.timedelta(seconds=adjusted_start_time + (i + 1) * duration_per_subtitle)
                 subtitles.append(srt.Subtitle(index=index + i, start=sub_start, end=sub_end, content=line))
-                # Append to subtitle_data_list for overlay
-                self.subtitle_data_list.append({
-                    'start_time': adjusted_start_time + i * duration_per_subtitle,
-                    'end_time': adjusted_start_time + (i + 1) * duration_per_subtitle,
-                    'text': line
-                })
 
             srt_content = srt.compose(subtitles)
-            srt_output_path = f'output/subtitles/subtitles_segment_{self.segment_index}.srt'
-            async with aiofiles.open(srt_output_path, 'a', encoding='utf-8') as f:
+
+            # Append to the single SRT file
+            async with aiofiles.open(self.srt_output_path, 'a', encoding='utf-8') as f:
                 await f.write(srt_content)
-            self.logger.info(f"Subtitle {index} for segment {self.segment_index} saved to {srt_output_path}")
+            self.logger.info(f"Subtitle {index} saved to {self.srt_output_path}")
 
             # Increment subtitle index for each split line
             self.subtitle_index += len(lines)
@@ -736,12 +759,12 @@ class OpenAIClient:
         """Mux video segment with corresponding audio segment and subtitles using FFmpeg"""
         video_path = f'output/video/output_video_segment_{segment_index}.mp4'
         audio_path = f'output/audio/output_audio_segment_{segment_index}.wav'
-        subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
+        subtitles_path = self.srt_output_path  # Use the single SRT file
         final_output_path = f'output/final/output_final_video_segment_{segment_index}.mp4'  # Save in output/final
 
-        # Check if video, audio, and subtitles files exist
+        # Check if video and audio files exist
         missing_files = []
-        for path in [video_path, audio_path, subtitles_path]:
+        for path in [video_path, audio_path]:
             if not os.path.exists(path):
                 missing_files.append(path)
         if missing_files:
@@ -865,8 +888,8 @@ class OpenAIClient:
         except Exception as e:
             self.logger.error(f"Error during FFmpeg muxing: {e}", exc_info=True)
         finally:
-            # Clear subtitle_data_list for the segment
-            self.subtitle_data_list.clear()
+            # No longer need to clear subtitle_data_list as we're using a single SRT file
+            pass
 
     async def heartbeat(self):
         """Send periodic heartbeat pings to keep the WebSocket connection alive."""
@@ -983,8 +1006,8 @@ class OpenAIClient:
                 except Exception as e:
                     self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
 
-                # Reset subtitle data for the new segment
-                self.subtitle_data_list.clear()
+                # Reset subtitle data for the new segment (no longer needed with single SRT)
+                self.current_subtitle = ""
 
                 while frame_count < segment_frames and self.running:
                     ret, frame = cap.read()
@@ -1074,8 +1097,9 @@ class OpenAIClient:
         }
         await self.enqueue_message(json.dumps(input_audio_append_event))
         self.logger.debug(f"Enqueued input_audio_buffer.append event with event_id: {event_id}")
-        # Track outgoing request by event_id
-        self.outgoing_requests[event_id] = {"type": "input_audio_buffer.append", "timestamp": time.perf_counter()}
+        # Track outgoing request by appending the sent timestamp to the queue
+        sent_timestamp = time.perf_counter()
+        self.sent_audio_queue.append(sent_timestamp)
 
     async def send_session_update(self):
         """Send session.update event to enforce translation instructions."""
@@ -1096,7 +1120,7 @@ class OpenAIClient:
             }
         }
         await self.enqueue_message(json.dumps(session_update_event))
-        self.logger.info(f"Enforced strict translation instructions with event_id: {event_id}")
+        self.logger.info(f"Enqueued session.update message with event_id: {event_id}")
 
     def generate_event_id(self) -> str:
         """Generate a unique event ID."""
