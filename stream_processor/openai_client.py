@@ -139,6 +139,12 @@ class OpenAIClient:
         self.srt_output_path = 'output/subtitles/subtitles.srt'
         asyncio.create_task(self.initialize_srt_file())
 
+        # Ensure directories for saving responses and processed audio exist
+        self.responses_dir = 'output/audio/responses'
+        self.processed_dir = 'output/audio/processed'
+        os.makedirs(self.responses_dir, exist_ok=True)
+        os.makedirs(self.processed_dir, exist_ok=True)
+
     async def initialize_srt_file(self):
         """Initialize the single SRT file by clearing any existing content."""
         try:
@@ -220,6 +226,8 @@ class OpenAIClient:
             'output/transcripts',
             'output/audio/input',
             'output/audio/output',
+            'output/audio/responses',   # Directory for saving raw audio responses
+            'output/audio/processed',   # Directory for saving processed audio
             'output/subtitles',
             'output/logs',
             'output/video',
@@ -403,6 +411,16 @@ class OpenAIClient:
                 else:
                     self.logger.error(f"No Wave_write object found for segment {self.segment_index}")
 
+            # **Save Processed Audio for Comparison**
+            processed_audio_filename = f"processed_{uuid.uuid4()}.wav"
+            processed_audio_path = os.path.join(self.processed_dir, processed_audio_filename)
+            with wave.open(processed_audio_path, 'wb') as wf_processed:
+                wf_processed.setnchannels(1)
+                wf_processed.setsampwidth(2)  # 16-bit PCM
+                wf_processed.setframerate(24000)
+                wf_processed.writeframes(audio_data)
+            self.logger.info(f"Saved processed audio to {processed_audio_path}")
+
         except Exception as e:
             self.logger.error(f"Error processing playback chunk: {e}", exc_info=True)
 
@@ -493,9 +511,9 @@ class OpenAIClient:
             "response": {
                 "modalities": ["text", "audio"],
                 "instructions": (
-                    "You are a real-time translator. Please translate the audio you receive into German. "
-                    "Try to keep the original tone, emotion and intonation. "
-                    "Adjust the voice to match the original speaker's gender."
+                    "You are a real-time translator. Translate the audio you receive into German without performing Voice Activity Detection (VAD). "
+                    "Ensure that the translated audio matches the input audio's duration and timing exactly to facilitate synchronization with video."
+                    "Do not respond conversationally."
                 ),
                 "voice": selected_voice
             }
@@ -559,15 +577,15 @@ class OpenAIClient:
                     audio_data = event.get("delta", "")
                     # event_id is no longer used for mapping
 
-                    # Directly associate with the first audio chunk in the queue
                     if audio_data:
                         self.logger.info("Received audio delta")
-                        self.last_translated_audio_received_time = time.perf_counter()
+                        receive_time = time.perf_counter()
+                        self.last_translated_audio_received_time = receive_time
 
                         # Calculate processing delay if possible
                         if self.sent_audio_queue:
                             sent_timestamp = self.sent_audio_queue.popleft()
-                            processing_delay = self.last_translated_audio_received_time - sent_timestamp
+                            processing_delay = receive_time - sent_timestamp
                             self.processing_delays.append(processing_delay)
                             self.logger.debug(f"Processing delay recorded: {processing_delay} seconds")
 
@@ -588,16 +606,26 @@ class OpenAIClient:
                             else:
                                 self.logger.debug(f"Decoded audio data: {len(decoded_audio)} bytes")
 
-                            # Calculate the start time for this audio chunk based on processing delays
-                            # Estimate the start time relative to video_start_time
+                            # **Save Raw Audio Response for Verification**
+                            response_audio_filename = f"{uuid.uuid4()}.wav"
+                            response_audio_path = os.path.join(self.responses_dir, response_audio_filename)
+                            with wave.open(response_audio_path, 'wb') as wf_response:
+                                wf_response.setnchannels(1)
+                                wf_response.setsampwidth(2)  # 16-bit PCM
+                                wf_response.setframerate(24000)
+                                wf_response.writeframes(decoded_audio)
+                            self.logger.info(f"Saved raw audio response to {response_audio_path}")
+
+                            # **Enqueue Audio for Playback**
                             if self.processing_delays:
-                                # Estimate based on average processing delay
-                                estimated_start_time = self.video_start_time + (len(self.processing_delays) * self.segment_duration) - self.average_processing_delay
+                                # Use the sent timestamp plus processing delay as the start time
+                                estimated_start_time = sent_timestamp + self.processing_delays[-1]
                             else:
-                                estimated_start_time = self.video_start_time
+                                estimated_start_time = receive_time - self.average_processing_delay
 
                             await self.enqueue_audio(decoded_audio, estimated_start_time)
-                            self.logger.debug(f"Processed audio delta.")
+                            self.logger.debug(f"Processed audio delta with estimated_start_time: {estimated_start_time}")
+
                         except Exception as e:
                             self.logger.error(f"Error handling audio data: {e}", exc_info=True)
                     else:
@@ -1109,8 +1137,10 @@ class OpenAIClient:
             "type": "session.update",
             "session": {
                 "instructions": (
-                    "You are a real-time translator. Translate the audio you receive into German. "
-                    "Do not respond conversationally."
+                    "You are a real-time translator. Translate the audio you receive into German without answer conversationally. "
+                    "Ensure that the translated audio matches the input audio's duration and timing exactly to facilitate synchronization with video."
+                    "Also include the silences from the input audio."
+                    "The output you produce is supposed to be a real-time translation. "
                 ),
                 "modalities": ["text", "audio"],
                 "voice": "alloy",
