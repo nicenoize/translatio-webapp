@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import base64
-from typing import Optional
+from typing import Optional, Dict, List
 import wave
 import numpy as np
 import simpleaudio as sa  # For playing audio locally
@@ -22,6 +22,8 @@ from logging.handlers import RotatingFileHandler
 import subprocess
 import signal
 import uuid
+import csv
+import statistics
 
 
 class OpenAIClient:
@@ -32,7 +34,7 @@ class OpenAIClient:
         self.setup_logging()
         self.logger = logging.getLogger(self.__class__.__name__)
         self.logger.info("OpenAIClient initialized.")
-        self.outgoing_requests = {}
+        self.outgoing_requests: Dict[str, Dict] = {}
 
         self.running = True  # Initialize the running flag
 
@@ -42,8 +44,8 @@ class OpenAIClient:
         self.video_start_time: Optional[float] = None  # Will be set once when video processing starts
         self.last_audio_sent_time: Optional[float] = None
         self.last_translated_audio_received_time: Optional[float] = None
-        self.processing_delays = []
-        self.average_processing_delay = 0.0
+        self.processing_delays: List[float] = []
+        self.average_processing_delay: float = 0.0
 
         # Define stream URL (Replace with your actual stream URL)
         self.stream_url = 'https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t'
@@ -114,7 +116,7 @@ class OpenAIClient:
         # Initialize total frames
         self.total_frames = 0  # Total number of audio frames processed
 
-        # Set segment duration for video splitting (e.g., 5 seconds)
+        # Set segment duration for video splitting (e.g., 10 seconds)
         self.segment_duration = 10  # in seconds
         self.segment_index = 1  # To keep track of video segments
         self.segment_start_time = None  # Start time of the current segment
@@ -125,6 +127,9 @@ class OpenAIClient:
 
         # Initialize audio buffer (simple queue for sequential processing)
         self.audio_buffer = deque(maxlen=100)  # Adjust maxlen as needed
+
+        # Initialize delay benchmarking
+        self.setup_delay_benchmarking()
 
     def setup_logging(self):
         """Setup logging with RotatingFileHandler to prevent log files from growing too large."""
@@ -143,6 +148,54 @@ class OpenAIClient:
         console_formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
+
+    def setup_delay_benchmarking(self):
+        """Setup delay benchmarking by initializing a CSV file to store delay metrics."""
+        self.delay_benchmark_file = 'output/logs/delay_benchmark.csv'
+        file_exists = os.path.isfile(self.delay_benchmark_file)
+        if not file_exists:
+            # Write header if file does not exist
+            with open(self.delay_benchmark_file, mode='w', newline='') as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow([
+                    'Timestamp',
+                    'ProcessingDelay',
+                    'AverageProcessingDelay',
+                    'MinProcessingDelay',
+                    'MaxProcessingDelay',
+                    'StdDevProcessingDelay'
+                ])
+            self.logger.info(f"Initialized delay benchmark file at {self.delay_benchmark_file}")
+        else:
+            self.logger.info(f"Delay benchmark file already exists at {self.delay_benchmark_file}")
+
+    def log_delay_metrics(self):
+        """Log the current delay metrics to the benchmark CSV file."""
+        if not self.processing_delays:
+            self.logger.debug("No processing delays to log.")
+            return
+
+        current_time = datetime.datetime.utcnow().isoformat()
+        processing_delay = self.processing_delays[-1]
+        average_delay = statistics.mean(self.processing_delays)
+        min_delay = min(self.processing_delays)
+        max_delay = max(self.processing_delays)
+        stddev_delay = statistics.stdev(self.processing_delays) if len(self.processing_delays) > 1 else 0.0
+
+        try:
+            with open(self.delay_benchmark_file, mode='a', newline='') as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow([
+                    current_time,
+                    f"{processing_delay:.6f}",
+                    f"{average_delay:.6f}",
+                    f"{min_delay:.6f}",
+                    f"{max_delay:.6f}",
+                    f"{stddev_delay:.6f}"
+                ])
+            self.logger.debug("Logged delay metrics to benchmark file.")
+        except Exception as e:
+            self.logger.error(f"Failed to log delay metrics: {e}", exc_info=True)
 
     def create_directories(self):
         """Create necessary directories for outputs."""
@@ -298,6 +351,7 @@ class OpenAIClient:
             expected_playback_time = self.video_start_time + elapsed_time
             current_time = time.perf_counter()
             delay = expected_playback_time - current_time
+
             if delay > 0:
                 self.logger.debug(f"Delaying audio playback for {delay:.3f} seconds to synchronize with video.")
                 await asyncio.sleep(delay)
@@ -356,11 +410,13 @@ class OpenAIClient:
         try:
             if self.ws and self.ws.open:
                 await self.ws.send(data)
+                self.logger.debug(f"Sent message: {data}")
             else:
                 self.logger.warning("WebSocket is closed. Attempting to reconnect...")
                 await self.reconnect()
                 if self.ws and self.ws.open:
                     await self.ws.send(data)
+                    self.logger.debug(f"Sent message after reconnection: {data}")
                 else:
                     self.logger.error("Failed to reconnect. Cannot send data.")
         except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
@@ -368,6 +424,7 @@ class OpenAIClient:
             await self.reconnect()
             if self.ws and self.ws.open:
                 await self.ws.send(data)
+                self.logger.debug(f"Sent message after reconnection: {data}")
             else:
                 self.logger.error("Failed to reconnect. Cannot send data.")
         except Exception as e:
@@ -409,7 +466,7 @@ class OpenAIClient:
             "response": {
                 "modalities": ["text", "audio"],
                 "instructions": (
-                    "You are a real-time tranlator. Please translate the audio you receive into German. "
+                    "You are a real-time translator. Please translate the audio you receive into German. "
                     "Try to keep the original tone, emotion and intonation. "
                     "Adjust the voice to match the original speaker's gender."
                 ),
@@ -426,7 +483,7 @@ class OpenAIClient:
                 response = await self.ws.recv()
                 event = json.loads(response)
                 event_type = event.get("type")
-                event_id = event.get("event_id")  # Not used anymore
+                event_id = event.get("event_id")  # Used for mapping responses
 
                 self.logger.debug(f"Received event: {event_type} with event_id: {event_id}")
 
@@ -489,16 +546,21 @@ class OpenAIClient:
                             if self.processing_delays:
                                 self.average_processing_delay = sum(self.processing_delays) / len(self.processing_delays)
                                 self.logger.debug(f"Updated average processing delay: {self.average_processing_delay} seconds")
+                            
+                            # Log delay metrics for benchmarking
+                            self.log_delay_metrics()
                         else:
                             self.logger.warning("last_audio_sent_time is None. Cannot calculate processing delay.")
 
                         try:
                             decoded_audio = base64.b64decode(audio_data)
-                            request_info = self.outgoing_requests[event_id] = {
-                                "type": "input_audio_buffer.append",
-                                "timestamp": time.perf_counter()
-                            }
-                            start_time = request_info.get("timestamp", time.perf_counter())
+                            # Ensure event_id exists in outgoing_requests
+                            if event_id in self.outgoing_requests:
+                                request_info = self.outgoing_requests[event_id]
+                                start_time = request_info.get("timestamp", time.perf_counter())
+                            else:
+                                self.logger.warning(f"Received response for unknown event_id: {event_id}")
+                                start_time = time.perf_counter()  # Fallback to current time
 
                             if len(decoded_audio) == 0:
                                 self.logger.warning("Decoded audio data is empty.")
@@ -506,7 +568,6 @@ class OpenAIClient:
                                 self.logger.debug(f"Decoded audio data: {len(decoded_audio)} bytes")
 
                             # Calculate the start time for this audio chunk
-
                             await self.enqueue_audio(decoded_audio, start_time)
                             self.logger.debug(f"Processed audio delta for event_id: {event_id}")
                         except Exception as e:
@@ -522,7 +583,6 @@ class OpenAIClient:
                     else:
                         self.logger.debug("Received empty transcript delta.")
                         self.logger.debug(f"Accumulated subtitle text: {self.current_subtitle}")
-                        
 
                 elif event_type in [
                     "response.audio.done",
@@ -1017,7 +1077,6 @@ class OpenAIClient:
         # Track outgoing request by event_id
         self.outgoing_requests[event_id] = {"type": "input_audio_buffer.append", "timestamp": time.perf_counter()}
 
-
     async def send_session_update(self):
         """Send session.update event to enforce translation instructions."""
         event_id = self.generate_event_id()
@@ -1038,7 +1097,6 @@ class OpenAIClient:
         }
         await self.enqueue_message(json.dumps(session_update_event))
         self.logger.info(f"Enforced strict translation instructions with event_id: {event_id}")
-
 
     def generate_event_id(self) -> str:
         """Generate a unique event ID."""
