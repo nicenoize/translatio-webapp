@@ -16,13 +16,14 @@ import time
 import cv2
 from logging.handlers import RotatingFileHandler
 import subprocess
-import signal
 import uuid
 import csv
 import statistics
 from aiohttp import web
 from typing import Optional
 import librosa  # For audio processing
+from datetime import timedelta
+import threading
 
 # Constants
 API_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
@@ -35,6 +36,11 @@ STREAM_URL = 'https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp:/
 MUXING_QUEUE_MAXSIZE = 100
 DASHBOARD_PORT = 8080
 INPUT_AUDIO_PIPE = os.path.abspath('input_audio_pipe')  # Absolute path for the named pipe
+VIDEO_PIPE = os.path.abspath('video_pipe')              # Named pipe for video frames
+AUDIO_PIPE = os.path.abspath('audio_pipe')              # Named pipe for audio data
+
+# RTMP Streaming URL
+RTMP_URL = 'rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live'
 
 # Voice Identifiers (Replace these with actual voice IDs from your API)
 MALE_VOICE_ID = "shimmer"      
@@ -72,7 +78,7 @@ class OpenAIClient:
         self.playback_event = asyncio.Event()
 
         # Timestamps
-        self.video_start_time = None
+        self.video_start_time = time.perf_counter()
 
         # Subtitle management
         self.subtitle_index = 1
@@ -113,7 +119,6 @@ class OpenAIClient:
             "audio_queue_size": 0,
             "muxing_queue_size": 0
         }
-        self.dashboard_server = None  # Will be initialized later
 
         # Queue to track sent audio timestamps
         self.sent_audio_timestamps = deque()
@@ -126,6 +131,17 @@ class OpenAIClient:
 
         # Lock to ensure only one active response
         self.response_lock = asyncio.Lock()
+
+        # Initialize FFmpeg subprocess for streaming
+        self.ffmpeg_process = None
+
+        # Initialize VideoWriter for local video recording
+        self.local_video_writer = None
+        self.init_local_video_writer()
+
+        # Initialize thread locks for named pipes
+        self.video_pipe_lock = threading.Lock()
+        self.audio_pipe_lock = threading.Lock()
 
     def setup_logging(self):
         """Setup main logging with RotatingFileHandler."""
@@ -222,6 +238,23 @@ class OpenAIClient:
                 self.logger.info(f"Delay benchmark CSV already exists at {self.delay_benchmark_file}")
         except Exception as e:
             self.logger.error(f"Failed to setup delay benchmarking: {e}")
+
+    def init_local_video_writer(self):
+        """Initialize VideoWriter for saving local video."""
+        try:
+            os.makedirs('output/video', exist_ok=True)
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            fps = 30.0  # Adjust based on your video stream
+            frame_size = (1280, 720)  # Adjust based on your video stream
+            local_video_path = 'output/video/local_test_video.avi'
+            self.local_video_writer = cv2.VideoWriter(local_video_path, fourcc, fps, frame_size)
+            if not self.local_video_writer.isOpened():
+                self.logger.error(f"Failed to open VideoWriter for local video at {local_video_path}")
+            else:
+                self.logger.info(f"Local VideoWriter initialized at {local_video_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize local VideoWriter: {e}")
+            self.local_video_writer = None
 
     def log_delay_metrics(self):
         """Log delay metrics to CSV and update monitoring metrics."""
@@ -439,13 +472,8 @@ class OpenAIClient:
                 audio_chunk_size = len(base64.b64decode(audio_data)) if audio_data else 0
                 audio_duration = audio_chunk_size / (AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH) if audio_chunk_size else 0.0
                 # Calculate start and end times relative to video_start_time
-                if self.video_start_time:
-                    start_time = sent_time - self.video_start_time
-                    end_time = start_time + audio_duration + processing_delay
-                else:
-                    # If video_start_time is not set, default to 0
-                    start_time = 0.0
-                    end_time = audio_duration + processing_delay
+                start_time = sent_time - self.video_start_time
+                end_time = start_time + audio_duration + processing_delay
 
                 self.logger.info(f"Received transcript: {transcript}")
                 self.logger.info(f"Subtitle timing - Start: {start_time}, End: {end_time}")
@@ -589,7 +617,7 @@ class OpenAIClient:
         async with self.response_lock:
             # Path to the latest audio segment for gender detection
             latest_audio_segment = f'output/audio/output_audio_segment_{self.subtitle_index - 1}.wav'
-            
+
             # Detect gender
             gender = self.predict_gender(latest_audio_segment)
             if gender == 'male':
@@ -598,7 +626,7 @@ class OpenAIClient:
                 selected_voice = FEMALE_VOICE_ID  # Replace with actual voice identifier for female
             else:
                 selected_voice = DEFAULT_VOICE_ID  # Default voice
-            
+
             self.logger.info(f"Detected gender: {gender}. Selected voice: {selected_voice}")
 
             response_event = {
@@ -655,6 +683,7 @@ class OpenAIClient:
         self.logger.info("Starting to read from input_audio_pipe.")
         while self.running:
             try:
+                # Open the pipe once and keep it open
                 async with aiofiles.open(INPUT_AUDIO_PIPE, 'rb') as pipe:
                     while self.running:
                         data = await pipe.read(131072)  # 128KB
@@ -722,13 +751,29 @@ class OpenAIClient:
                 self.current_audio_segment_wf.writeframes(audio_data)
                 self.logger.debug("Written translated audio chunk to current audio segment WAV file.")
 
+            # Also, write to audio_pipe for FFmpeg streaming in a separate thread to prevent blocking
+            if self.ffmpeg_process and self.ffmpeg_process.stdin:
+                try:
+                    await asyncio.to_thread(self.ffmpeg_process.stdin.write, audio_data)
+                    await asyncio.to_thread(self.ffmpeg_process.stdin.flush)
+                    self.logger.debug("Written translated audio chunk to audio_pipe for streaming.")
+                except Exception as e:
+                    self.logger.error(f"Error writing audio to FFmpeg stdin: {e}")
+
         except Exception as e:
             self.logger.error(f"Error playing audio: {e}")
 
     async def mux_audio_video_subtitles(self):
         """
-        Asynchronous task to mux audio, video, and subtitles using FFmpeg with enhanced reliability.
+        Asynchronous task to mux audio, video, and subtitles and stream to RTMP using FFmpeg.
         """
+        # Create named pipes for video and audio if they don't exist
+        self.create_named_pipe(VIDEO_PIPE)
+        self.create_named_pipe(AUDIO_PIPE)
+
+        # Start FFmpeg subprocess for streaming
+        self.start_ffmpeg_streaming()
+
         while self.running:
             try:
                 # Wait for a muxing job
@@ -737,174 +782,90 @@ class OpenAIClient:
                     self.logger.info("Muxing queue received shutdown signal.")
                     break
 
-                video_path = job['video']
-                audio_path = job['audio']
-                subtitles_path = job['subtitles']
-                final_output_path = job['output']
-                segment_index = job['segment_index']
+                # Since we're streaming continuously, we don't process per segment
+                # Instead, FFmpeg handles the stream based on data written to the pipes
 
-                self.muxing_logger.info(f"Muxing audio and video for segment {segment_index}.")
+                # Alternatively, handle any per-job tasks if needed
+                self.muxing_logger.info(f"Handling muxing job for segment {job.get('segment_index')}.")
 
-                # Check if video and audio files exist
-                if not os.path.exists(video_path):
-                    self.muxing_logger.error(f"Video file does not exist: {video_path}")
-                    self.muxing_queue.task_done()
-                    continue
-                if not os.path.exists(audio_path):
-                    self.muxing_logger.error(f"Audio file does not exist: {audio_path}")
-                    self.muxing_queue.task_done()
-                    continue
-
-                # Check file sizes to ensure they are not empty
-                min_video_size = 1000  # bytes
-                min_audio_size = 100  # bytes
-                try:
-                    video_size = os.path.getsize(video_path)
-                    audio_size = os.path.getsize(audio_path)
-                    if video_size < min_video_size:
-                        self.muxing_logger.error(f"Video file {video_path} is too small ({video_size} bytes). Skipping muxing.")
-                        self.muxing_queue.task_done()
-                        continue
-                    if audio_size < min_audio_size:
-                        self.muxing_logger.error(f"Audio file {audio_path} is too small ({audio_size} bytes). Skipping muxing.")
-                        self.muxing_queue.task_done()
-                        continue
-                except Exception as e:
-                    self.muxing_logger.error(f"Error getting file sizes: {e}")
-                    self.muxing_queue.task_done()
-                    continue
-
-                # Implement a retry mechanism with a maximum number of attempts
-                max_attempts = 5
-                attempt = 1
-                while attempt <= max_attempts:
-                    # Ensure video file is properly closed by checking with ffprobe
-                    is_valid = await self.verify_video_file(video_path)
-                    if is_valid:
-                        break
-                    else:
-                        self.muxing_logger.warning(f"Video file {video_path} is invalid. Retrying in 2 seconds... (Attempt {attempt}/{max_attempts})")
-                        await asyncio.sleep(2)
-                        attempt += 1
-
-                if not is_valid:
-                    self.muxing_logger.error(f"Video file {video_path} remains invalid after {max_attempts} attempts.")
-                    self.muxing_queue.task_done()
-                    continue
-
-                # Ensure audio file is closed
-                is_audio_valid = await self.verify_audio_file(audio_path)
-                if not is_audio_valid:
-                    self.muxing_logger.error(f"Audio file {audio_path} is invalid.")
-                    self.muxing_queue.task_done()
-                    continue
-
-                # Introduce a small delay to ensure file system has completed writing
-                await asyncio.sleep(0.5)  # 500 milliseconds
-
-                # FFmpeg command to mux audio, video, and subtitles
-                ffmpeg_command = [
-                    'ffmpeg',
-                    '-y',  # Overwrite output files without asking
-                    '-i', video_path,
-                    '-i', audio_path,
-                    '-vf', f"subtitles={subtitles_path}:force_style='FontSize=24,PrimaryColour=&HFFFFFF&'",
-                    '-c:v', 'libx264',  # Re-encode video to ensure compatibility
-                    '-c:a', 'aac',       # Encode audio to AAC for better compatibility
-                    '-strict', 'experimental',
-                    final_output_path
-                ]
-
-                self.muxing_logger.debug(f"Running FFmpeg command: {' '.join(ffmpeg_command)}")
-                process = subprocess.run(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-                if process.returncode == 0:
-                    self.muxing_logger.info(f"Successfully muxed video to {final_output_path}")
-                else:
-                    self.muxing_logger.error(f"FFmpeg muxing failed for segment {segment_index}.")
-                    self.muxing_logger.error(f"FFmpeg stderr: {process.stderr}")
-                    self.muxing_logger.error(f"FFmpeg stdout: {process.stdout}")
-
+                # Task is done
                 self.muxing_queue.task_done()
 
             except Exception as e:
                 self.muxing_logger.error(f"Error in mux_audio_video_subtitles: {e}")
 
-    async def verify_video_file(self, video_path: str) -> bool:
-        """Verify if the video file is valid using ffprobe."""
+    def start_ffmpeg_streaming(self):
+        """Start FFmpeg subprocess to stream video and audio to RTMP URL."""
         try:
-            probe = subprocess.run(
-                ['ffprobe', '-v', 'error', '-show_format', '-show_streams', video_path],
+            # Retrieve video properties from the video_pipe
+            # For simplicity, assume a fixed resolution and frame rate. Adjust as needed.
+            video_width = 1280
+            video_height = 720
+            video_fps = 30
+
+            ffmpeg_command = [
+                'ffmpeg',
+                '-y',  # Overwrite output files without asking
+                '-f', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                '-s', f'{video_width}x{video_height}',  # Replace with actual video resolution
+                '-r', str(video_fps),                    # Replace with actual FPS
+                '-i', VIDEO_PIPE,
+                '-f', 's16le',
+                '-ar', str(AUDIO_SAMPLE_RATE),
+                '-ac', str(AUDIO_CHANNELS),
+                '-i', AUDIO_PIPE,
+                '-vf', f"subtitles={SUBTITLE_PATH}:force_style='FontSize=24,PrimaryColour=&HFFFFFF&'",
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-maxrate', '3000k',
+                '-bufsize', '6000k',
+                '-c:a', 'aac',
+                '-b:a', '160k',
+                '-f', 'flv',
+                RTMP_URL
+            ]
+
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_command,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                bufsize=10**8  # Large buffer to prevent pipe blockage
             )
-            if probe.returncode == 0 and 'moov' in probe.stdout:
-                self.muxing_logger.debug(f"Video file {video_path} is valid.")
-                return True
-            else:
-                self.muxing_logger.error(f"Video file {video_path} is invalid. FFprobe output: {probe.stderr}")
-                return False
+
+            # Start a coroutine to monitor FFmpeg's stderr for logging
+            asyncio.create_task(self.monitor_ffmpeg_stream())
+
+            self.logger.info(f"Started FFmpeg subprocess for streaming to {RTMP_URL}")
         except Exception as e:
-            self.muxing_logger.error(f"Error verifying video file {video_path}: {e}")
-            return False
+            self.muxing_logger.error(f"Failed to start FFmpeg subprocess: {e}")
 
-    async def verify_audio_file(self, audio_path: str) -> bool:
-        """Verify if the audio file is valid using ffprobe."""
-        try:
-            probe = subprocess.run(
-                ['ffprobe', '-v', 'error', '-show_format', '-show_streams', audio_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            if probe.returncode == 0 and 'audio' in probe.stdout:
-                self.muxing_logger.debug(f"Audio file {audio_path} is valid.")
-                return True
-            else:
-                self.muxing_logger.error(f"Audio file {audio_path} is invalid. FFprobe output: {probe.stderr}")
-                return False
-        except Exception as e:
-            self.muxing_logger.error(f"Error verifying audio file {audio_path}: {e}")
-            return False
+    async def monitor_ffmpeg_stream(self):
+        """Monitor FFmpeg subprocess stderr and log the output."""
+        if not self.ffmpeg_process:
+            self.muxing_logger.error("FFmpeg process not initialized.")
+            return
 
-    async def write_vtt_subtitle(self, index: int, start_time: float, end_time: float, text: str):
-        """
-        Write a single subtitle entry to the WebVTT file.
+        while self.running:
+            try:
+                # Read a line from FFmpeg's stderr
+                line = await self.loop.run_in_executor(None, self.ffmpeg_process.stderr.readline)
+                if not line:
+                    break
+                decoded_line = line.decode('utf-8').strip()
+                if decoded_line:
+                    self.muxing_logger.info(f"FFmpeg: {decoded_line}")
+            except Exception as e:
+                self.muxing_logger.error(f"Error reading FFmpeg stderr: {e}")
+                break
 
-        :param index: Subtitle index.
-        :param start_time: Start time in seconds.
-        :param end_time: End time in seconds.
-        :param text: Subtitle text.
-        """
-        try:
-            # Convert seconds to WebVTT timestamp format HH:MM:SS.mmm.
-            start_vtt = self.format_timestamp_vtt(start_time)
-            end_vtt = self.format_timestamp_vtt(end_time)
-
-            # Prepare subtitle entry.
-            subtitle = f"{index}\n{start_vtt} --> {end_vtt}\n{text}\n\n"
-
-            # Append to the WebVTT file.
-            async with aiofiles.open(SUBTITLE_PATH, 'a', encoding='utf-8') as f:
-                await f.write(subtitle)
-            self.logger.debug(f"Written subtitle {index} to WebVTT.")
-        except Exception as e:
-            self.logger.error(f"Error writing WebVTT subtitle {index}: {e}")
-
-    def format_timestamp_vtt(self, seconds: float) -> str:
-        """
-        Format seconds to WebVTT timestamp format HH:MM:SS.mmm.
-
-        :param seconds: Time in seconds.
-        :return: Formatted timestamp string.
-        """
-        td = datetime.timedelta(seconds=seconds)
-        total_seconds = int(td.total_seconds())
-        milliseconds = int((td.total_seconds() - total_seconds) * 1000)
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        return f"{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}"
+        # After the loop, check FFmpeg exit status
+        exit_code = self.ffmpeg_process.poll()
+        if exit_code is not None and exit_code != 0:
+            self.muxing_logger.error(f"FFmpeg exited with code {exit_code}")
+        else:
+            self.muxing_logger.info("FFmpeg subprocess terminated gracefully.")
 
     async def run_dashboard_server(self):
         """Run the real-time monitoring dashboard using aiohttp."""
@@ -975,7 +936,7 @@ class OpenAIClient:
         """Provide metrics in JSON format for the dashboard."""
         # Convert deque to list for JSON serialization
         serializable_metrics = self.metrics.copy()
-        serializable_metrics["processing_delays"] = list(serializable_metrics["processing_delays"])
+        serializable_metrics["processing_delays"] = list(self.metrics["processing_delays"])
         return web.json_response(serializable_metrics)
 
     async def run(self):
@@ -1004,8 +965,6 @@ class OpenAIClient:
 
         # Start video processing
         self.video_processing_task = asyncio.create_task(self.run_video_processing())
-
-        # No need to start another muxing_task here since it's already started in __init__
 
         # Wait for all tasks to complete
         done, pending = await asyncio.wait(
@@ -1072,6 +1031,14 @@ class OpenAIClient:
             with suppress(asyncio.CancelledError):
                 await self.video_processing_task
 
+        # Close local video writer
+        if self.local_video_writer:
+            try:
+                self.local_video_writer.release()
+                self.logger.info("Local VideoWriter released.")
+            except Exception as e:
+                self.logger.error(f"Error releasing VideoWriter: {e}")
+
         # Close current audio segment WAV file
         if self.current_audio_segment_wf:
             try:
@@ -1087,6 +1054,17 @@ class OpenAIClient:
                 self.logger.info("Output WAV file closed.")
             except Exception as e:
                 self.logger.error(f"Error closing WAV file: {e}")
+
+        # Terminate FFmpeg subprocess
+        if self.ffmpeg_process:
+            try:
+                if self.ffmpeg_process.stdin:
+                    self.ffmpeg_process.stdin.close()
+                self.ffmpeg_process.terminate()
+                await asyncio.to_thread(self.ffmpeg_process.wait, timeout=5)
+                self.logger.info("FFmpeg subprocess terminated.")
+            except Exception as e:
+                self.logger.error(f"Error terminating FFmpeg subprocess: {e}")
 
         self.logger.info("Client disconnected successfully.")
 
@@ -1122,102 +1100,158 @@ class OpenAIClient:
 
             self.logger.info(f"Video properties - FPS: {fps}, Width: {width}, Height: {height}")
 
-            # Initialize variables for video segmentation
-            segment_duration = 10  # seconds
-            segment_frames = int(fps * segment_duration)
-            frame_count = 0
-            self.segment_start_time = time.perf_counter()
+            # Initialize local VideoWriter if not already
+            if self.local_video_writer is None:
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                local_video_path = 'output/video/local_test_video.avi'
+                self.local_video_writer = cv2.VideoWriter(local_video_path, fourcc, fps, (width, height))
+                if not self.local_video_writer.isOpened():
+                    self.logger.error(f"Failed to open VideoWriter for local video at {local_video_path}")
+                else:
+                    self.logger.info(f"Local VideoWriter initialized at {local_video_path}")
 
-            if self.video_start_time is None:
-                self.video_start_time = self.segment_start_time
+            # Open video_pipe once and keep it open
+            try:
+                video_pipe_fd = os.open(VIDEO_PIPE, os.O_WRONLY)
+                with os.fdopen(video_pipe_fd, 'wb') as video_pipe:
+                    self.logger.info(f"Opened video_pipe for writing: {VIDEO_PIPE}")
+                    while self.running:
+                        ret, frame = cap.read()
+                        if not ret:
+                            self.logger.warning("Failed to read frame from video stream.")
+                            break
 
-            while self.running:
-                # Define video writer for each segment
-                segment_output_path = f'output/video/output_video_segment_{self.subtitle_index}.mp4'
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Alternative codec
+                        # Write frame to video_pipe asynchronously to prevent blocking
+                        asyncio.run_coroutine_threadsafe(
+                            self.write_frame_to_pipe(video_pipe, frame),
+                            self.loop
+                        )
 
-                out = cv2.VideoWriter(segment_output_path, fourcc, fps, (width, height))
-                if not out.isOpened():
-                    self.logger.error(f"Failed to open VideoWriter for segment {self.subtitle_index}.")
-                    self.running = False
-                    break
+                        # Write frame to local video for testing
+                        if self.local_video_writer:
+                            try:
+                                self.local_video_writer.write(frame)
+                                self.logger.debug("Written frame to local VideoWriter.")
+                            except Exception as e:
+                                self.logger.error(f"Error writing frame to local VideoWriter: {e}")
 
-                self.logger.info(f"Started recording segment {self.subtitle_index} to {segment_output_path}")
+            except Exception as e:
+                self.logger.error(f"Error opening video_pipe for writing: {e}")
 
-                # Initialize the corresponding audio segment file
-                audio_segment_path = f'output/audio/output_audio_segment_{self.subtitle_index}.wav'
-                try:
-                    wf = wave.open(audio_segment_path, 'wb')
-                    wf.setnchannels(AUDIO_CHANNELS)
-                    wf.setsampwidth(AUDIO_SAMPLE_WIDTH)
-                    wf.setframerate(AUDIO_SAMPLE_RATE)
-                    self.current_audio_segment_wf = wf  # Reference for writing translated audio
-                    self.logger.debug(f"Initialized audio segment file: {audio_segment_path}")
-                except Exception as e:
-                    self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
-                    # Close VideoWriter if audio segment fails
-                    out.release()
-                    self.logger.info(f"Released VideoWriter for segment {self.subtitle_index} due to audio init failure.")
-                    self.current_audio_segment_wf = None
-                    continue
+            # Release video capture and VideoWriter
+            cap.release()
+            self.logger.info("Video capture released.")
 
-                frames_written = 0
-                while frame_count < segment_frames and self.running:
-                    ret, frame = cap.read()
-                    if not ret:
-                        self.logger.warning("Failed to read frame from video stream.")
-                        break
-                    out.write(frame)
-                    frame_count += 1
-                    frames_written += 1
-                    if frames_written % int(fps) == 0:
-                        self.logger.debug(f"Written {frames_written} frames to segment {self.subtitle_index}.")
-
-                # Release the video writer
-                out.release()
-                self.logger.info(f"Segment {self.subtitle_index} saved to {segment_output_path}. Frames written: {frames_written}")
-
-                # Increase delay to ensure file system flush
-                time.sleep(2)  # 2 seconds
-
-                # Log file sizes
-                try:
-                    video_size = os.path.getsize(segment_output_path)
-                    audio_size = os.path.getsize(audio_segment_path)
-                    self.logger.info(f"Video segment size: {video_size} bytes")
-                    self.logger.info(f"Audio segment size: {audio_size} bytes")
-                except Exception as e:
-                    self.logger.error(f"Error getting file sizes: {e}")
-
-                # Close the audio WAV file
-                try:
-                    wf.close()
-                    self.logger.debug(f"Closed audio segment file: {audio_segment_path}")
-                    self.current_audio_segment_wf = None
-                except Exception as e:
-                    self.logger.error(f"Failed to close audio segment file {audio_segment_path}: {e}")
-
-                # Enqueue muxing job
-                final_output_path = f'output/final/output_final_video_segment_{self.subtitle_index}.mp4'
-                muxing_job = {
-                    "segment_index": self.subtitle_index,
-                    "video": segment_output_path,
-                    "audio": audio_segment_path,
-                    "subtitles": SUBTITLE_PATH,
-                    "output": final_output_path
-                }
-                # Enqueue muxing job in a thread-safe manner
-                self.loop.call_soon_threadsafe(
-                    asyncio.create_task,
-                    self.enqueue_muxing_job(muxing_job)
-                )
-
-                # Reset for next segment
-                self.subtitle_index += 1
-                frame_count = 0
-                self.segment_start_time = time.perf_counter()
+            if self.local_video_writer:
+                self.local_video_writer.release()
+                self.logger.info("Local VideoWriter released.")
 
         except Exception as e:
             self.logger.error(f"Error in start_video_processing: {e}", exc_info=True)
             self.running = False
 
+    async def write_frame_to_pipe(self, pipe, frame):
+        """Asynchronously write a video frame to the named pipe."""
+        try:
+            await asyncio.to_thread(pipe.write, frame.tobytes())
+            await asyncio.to_thread(pipe.flush)
+            self.logger.debug("Written frame to video_pipe.")
+        except Exception as e:
+            self.logger.error(f"Error writing frame to video_pipe: {e}")
+
+    def parse_vtt(self, file_path: str) -> list:
+        """
+        Simple WebVTT parser to extract subtitles.
+
+        :param file_path: Path to the WebVTT file.
+        :return: List of subtitle dictionaries with 'start', 'end', and 'text'.
+        """
+        subtitles = []
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            index = 0
+            while index < len(lines):
+                line = lines[index].strip()
+                if line.isdigit():
+                    index += 1
+                    if index >= len(lines):
+                        break
+                    timing_line = lines[index].strip()
+                    if '-->' in timing_line:
+                        start, end = timing_line.split('-->')
+                        start = self.convert_vtt_time_to_seconds(start.strip())
+                        end = self.convert_vtt_time_to_seconds(end.strip())
+                        index += 1
+                        text_lines = []
+                        while index < len(lines) and lines[index].strip():
+                            text_lines.append(lines[index].strip())
+                            index += 1
+                        text = ' '.join(text_lines)
+                        subtitles.append({'start': start, 'end': end, 'text': text})
+                else:
+                    index += 1
+        except Exception as e:
+            self.muxing_logger.error(f"Error parsing VTT file {file_path}: {e}")
+        return subtitles
+
+    def convert_vtt_time_to_seconds(self, timestamp: str) -> float:
+        """
+        Convert WebVTT timestamp to seconds.
+
+        :param timestamp: Timestamp string in HH:MM:SS.mmm format.
+        :return: Time in seconds.
+        """
+        try:
+            parts = timestamp.split(':')
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2].replace(',', '.'))
+            return hours * 3600 + minutes * 60 + seconds
+        except Exception as e:
+            self.muxing_logger.error(f"Error converting timestamp '{timestamp}': {e}")
+            return 0.0
+
+    async def write_vtt_subtitle(self, index: int, start_time: float, end_time: float, text: str):
+        """
+        Write a single subtitle entry to the WebVTT file.
+
+        :param index: Subtitle index.
+        :param start_time: Start time in seconds.
+        :param end_time: End time in seconds.
+        :param text: Subtitle text.
+        """
+        try:
+            # Ensure minimum subtitle duration
+            min_duration = 1.0  # seconds
+            if (end_time - start_time) < min_duration:
+                end_time = start_time + min_duration
+
+            # Convert seconds to WebVTT timestamp format HH:MM:SS.mmm.
+            start_vtt = self.format_timestamp_vtt(start_time)
+            end_vtt = self.format_timestamp_vtt(end_time)
+
+            # Prepare subtitle entry.
+            subtitle = f"{index}\n{start_vtt} --> {end_vtt}\n{text}\n\n"
+
+            # Append to the WebVTT file.
+            async with aiofiles.open(SUBTITLE_PATH, 'a', encoding='utf-8') as f:
+                await f.write(subtitle)
+            self.logger.debug(f"Written subtitle {index} to WebVTT.")
+        except Exception as e:
+            self.logger.error(f"Error writing WebVTT subtitle {index}: {e}")
+
+    def format_timestamp_vtt(self, seconds: float) -> str:
+        """
+        Format seconds to WebVTT timestamp format HH:MM:SS.mmm.
+
+        :param seconds: Time in seconds.
+        :return: Formatted timestamp string.
+        """
+        td = datetime.timedelta(seconds=seconds)
+        total_seconds = int(td.total_seconds())
+        milliseconds = int((td.total_seconds() - total_seconds) * 1000)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}"
