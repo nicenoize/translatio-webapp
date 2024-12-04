@@ -7,6 +7,7 @@ set -euo pipefail
 if lsof -i :8000 -t >/dev/null; then
     echo "Port 8000 is in use. Attempting to free it..."
     lsof -i :8000 -t | xargs kill -9
+    lsof -i :8080 -t | xargs kill -9
     echo "Port 8000 has been freed."
 fi
 
@@ -73,6 +74,7 @@ cleanup() {
     rm -f "$INPUT_AUDIO_PIPE"
 
     lsof -i :8000 -t | xargs kill -9
+    lsof -i :8080 -t | xargs kill -9
     
     echo "Cleanup complete."
 }

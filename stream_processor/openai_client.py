@@ -11,7 +11,6 @@ import simpleaudio as sa
 from asyncio import Queue
 from collections import deque
 import datetime
-import srt
 from contextlib import suppress
 import time
 import cv2
@@ -106,6 +105,15 @@ class OpenAIClient:
             "muxing_queue_size": 0
         }
         self.dashboard_server = None  # Will be initialized later
+
+        # Queue to track sent audio timestamps
+        self.sent_audio_timestamps = deque()
+
+        # Video processing task
+        self.video_processing_task = None
+
+        # Reference to current audio segment WAV file for writing translated audio
+        self.current_audio_segment_wf = None
 
     def setup_logging(self):
         """Setup logging with RotatingFileHandler."""
@@ -267,6 +275,20 @@ class OpenAIClient:
         await self.send_queue.put(message)
         self.logger.debug(f"Message enqueued: {message['type']}")
 
+    async def enqueue_muxing_job(self, job: dict):
+        """
+        Enqueue a muxing job to the muxing_queue.
+
+        :param job: A dictionary containing paths for video, audio, subtitles, and output.
+        """
+        try:
+            await self.muxing_queue.put(job)
+            self.logger.debug(f"Enqueued muxing job for segment {job.get('segment_index')}.")
+        except asyncio.QueueFull:
+            self.logger.error("Muxing queue is full. Failed to enqueue muxing job.")
+        except Exception as e:
+            self.logger.error(f"Failed to enqueue muxing job: {e}")
+
     async def send_messages(self):
         """Coroutine to send messages from the send_queue."""
         while self.running:
@@ -335,6 +357,7 @@ class OpenAIClient:
             try:
                 response = await self.ws.recv()
                 event = json.loads(response)
+                self.logger.debug(f"Received event: {event}")  # Log entire event for debugging
                 await self.process_event(event)
             except websockets.exceptions.ConnectionClosedOK:
                 self.logger.warning("WebSocket connection closed normally.")
@@ -378,15 +401,53 @@ class OpenAIClient:
             else:
                 self.logger.debug("Received empty audio delta.")
 
-        elif event_type == "response.audio.done":
-            self.logger.info("Audio response completed.")
+        elif event_type == "response.audio_transcript.done":
+            transcript = event.get("transcript", "")
+            if self.sent_audio_timestamps:
+                sent_time = self.sent_audio_timestamps.popleft()
+                current_time = time.perf_counter()
+                processing_delay = current_time - sent_time
+                # Calculate audio duration based on chunk size
+                audio_data = event.get("audio", "")
+                audio_chunk_size = len(base64.b64decode(audio_data)) if audio_data else 0
+                audio_duration = audio_chunk_size / (AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH) if audio_chunk_size else 0.0
+                # Calculate start and end times relative to video_start_time
+                if self.video_start_time:
+                    start_time = sent_time - self.video_start_time
+                    end_time = start_time + audio_duration + processing_delay
+                else:
+                    # If video_start_time is not set, default to 0
+                    start_time = 0.0
+                    end_time = audio_duration + processing_delay
 
-        elif event_type == "response.text.done":
-            self.logger.info("Text response completed.")
+                self.logger.info(f"Received transcript: {transcript}")
+                self.logger.info(f"Subtitle timing - Start: {start_time}, End: {end_time}")
 
-        elif event_type == "response.function_call_arguments.done":
-            self.logger.info("Function call arguments completed.")
-            # Handle function call output if needed
+                # Append processing_delay
+                self.processing_delays.append(processing_delay)
+                self.log_delay_metrics()
+
+                await self.write_vtt_subtitle(self.subtitle_index, start_time, end_time, transcript)
+                self.subtitle_index += 1
+            else:
+                self.logger.warning("No sent audio timestamp available for transcript.")
+                # Optionally, assign default timings or skip
+
+        elif event_type == "response.content_part.done":
+            content_part = event.get("content_part", "")
+            # Handle content part if necessary
+            self.logger.info(f"Received content part: {content_part}")
+            # Depending on content, may need to process further
+
+        elif event_type == "response.output_item.done":
+            output_item = event.get("output_item", "")
+            # Handle output item if necessary
+            self.logger.info(f"Received output item: {output_item}")
+            # Depending on content, may need to process further
+
+        elif event_type == "response.done":
+            self.logger.info("Response processing completed.")
+            # Possibly perform any finalization or cleanup
 
         elif event_type == "error":
             error = event.get("error", {})
@@ -413,16 +474,11 @@ class OpenAIClient:
                 wf_response.writeframes(decoded_audio)
             self.logger.info(f"Saved raw audio response to {response_audio_path}")
 
-            # Enqueue audio for playback
+            # Enqueue audio for playback only once
             await self.translated_audio_queue.put(decoded_audio)
             self.logger.debug("Enqueued translated audio for playback.")
 
-            # Log processing delay
-            current_time = time.perf_counter()
-            if self.video_start_time:
-                processing_delay = current_time - self.video_start_time
-                self.processing_delays.append(processing_delay)
-                self.log_delay_metrics()
+            # No processing_delay calculation here
 
         except Exception as e:
             self.logger.error(f"Error handling audio delta: {e}")
@@ -549,7 +605,7 @@ class OpenAIClient:
             raise
 
     async def send_input_audio(self, audio_data: bytes):
-        """Send input audio to the Realtime API."""
+        """Send input audio to the Realtime API and record the send time."""
         try:
             pcm_base64 = base64.b64encode(audio_data).decode('utf-8')
             audio_event = {
@@ -557,7 +613,9 @@ class OpenAIClient:
                 "audio": pcm_base64
             }
             await self.enqueue_message(audio_event)
-            self.logger.debug("Sent input audio buffer append event.")
+            sent_time = time.perf_counter()
+            self.sent_audio_timestamps.append(sent_time)
+            self.logger.debug(f"Sent input audio buffer append event at {sent_time}.")
         except Exception as e:
             self.logger.error(f"Failed to send input audio: {e}")
 
@@ -572,7 +630,7 @@ class OpenAIClient:
                 self.logger.error(f"Error in audio_playback_handler: {e}")
 
     async def play_audio(self, audio_data: bytes):
-        """Play audio using simpleaudio."""
+        """Play audio using simpleaudio and write to both output WAV and current audio segment WAV."""
         try:
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
             play_obj = sa.play_buffer(audio_array, AUDIO_CHANNELS, AUDIO_SAMPLE_WIDTH, AUDIO_SAMPLE_RATE)
@@ -582,7 +640,12 @@ class OpenAIClient:
             # Write to output WAV
             if self.output_wav:
                 self.output_wav.writeframes(audio_data)
-                self.logger.debug("Written translated audio chunk to WAV file.")
+                self.logger.debug("Written translated audio chunk to output WAV file.")
+
+            # Write to current audio segment WAV
+            if self.current_audio_segment_wf:
+                self.current_audio_segment_wf.writeframes(audio_data)
+                self.logger.debug("Written translated audio chunk to current audio segment WAV file.")
 
         except Exception as e:
             self.logger.error(f"Error playing audio: {e}")
@@ -650,6 +713,7 @@ class OpenAIClient:
                 else:
                     self.logger.error(f"FFmpeg muxing failed for segment {segment_index}.")
                     self.logger.error(f"FFmpeg stderr: {process.stderr}")
+                    self.logger.error(f"FFmpeg stdout: {process.stdout}")
 
                 self.muxing_queue.task_done()
 
@@ -667,11 +731,8 @@ class OpenAIClient:
         """
         try:
             # Convert seconds to WebVTT timestamp format
-            start = str(datetime.timedelta(seconds=start_time))
-            end = str(datetime.timedelta(seconds=end_time))
-            # Ensure timestamps have milliseconds
-            start_vtt = self.format_timestamp_vtt(start)
-            end_vtt = self.format_timestamp_vtt(end)
+            start_vtt = self.format_timestamp_vtt(start_time)
+            end_vtt = self.format_timestamp_vtt(end_time)
 
             # Prepare subtitle entry
             subtitle = f"{index}\n{start_vtt} --> {end_vtt}\n{text}\n\n"
@@ -683,21 +744,19 @@ class OpenAIClient:
         except Exception as e:
             self.logger.error(f"Error writing WebVTT subtitle {index}: {e}")
 
-    def format_timestamp_vtt(self, timestamp: str) -> str:
+    def format_timestamp_vtt(self, seconds: float) -> str:
         """
-        Format a timestamp string to WebVTT format.
+        Format seconds to WebVTT timestamp format HH:MM:SS.mmm.
 
-        :param timestamp: Timestamp string.
-        :return: Formatted WebVTT timestamp.
+        :param seconds: Time in seconds.
+        :return: Formatted timestamp string.
         """
-        parts = timestamp.split('.')
-        if len(parts) == 1:
-            timestamp += ".000"
-        elif len(parts[1]) == 1:
-            timestamp += "00"
-        elif len(parts[1]) == 2:
-            timestamp += "0"
-        return timestamp
+        td = datetime.timedelta(seconds=seconds)
+        total_seconds = int(td.total_seconds())
+        milliseconds = int((td.total_seconds() - total_seconds) * 1000)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}"
 
     async def run_dashboard_server(self):
         """Run the real-time monitoring dashboard using aiohttp."""
@@ -766,7 +825,169 @@ class OpenAIClient:
 
     async def metrics_endpoint(self, request):
         """Provide metrics in JSON format for the dashboard."""
-        return web.json_response(self.metrics)
+        # Convert deque to list for JSON serialization
+        serializable_metrics = self.metrics.copy()
+        serializable_metrics["processing_delays"] = list(serializable_metrics["processing_delays"])
+        return web.json_response(serializable_metrics)
+
+    async def run(self):
+        """Run the OpenAIClient."""
+        # Start the dashboard
+        dashboard_task = asyncio.create_task(self.run_dashboard_server())
+
+        # Start WebSocket connection
+        try:
+            await self.connect()
+        except Exception as e:
+            self.logger.error(f"Initial connection failed: {e}")
+            await self.reconnect()
+
+        # Start message sender
+        send_task = asyncio.create_task(self.send_messages())
+
+        # Start handling responses
+        handle_responses_task = asyncio.create_task(self.handle_responses())
+
+        # Start reading input audio
+        read_audio_task = asyncio.create_task(self.read_input_audio())
+
+        # Start heartbeat
+        heartbeat_task = asyncio.create_task(self.heartbeat())
+
+        # Start video processing
+        self.video_processing_task = asyncio.create_task(self.run_video_processing())
+
+        # No need to start another muxing_task here since it's already started in __init__
+
+        # Wait for all tasks to complete
+        done, pending = await asyncio.wait(
+            [
+                send_task,
+                handle_responses_task,
+                read_audio_task,
+                heartbeat_task,
+                self.video_processing_task,
+                dashboard_task
+            ],
+            return_when=asyncio.FIRST_EXCEPTION
+        )
+
+        # Cancel pending tasks
+        for task in pending:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def heartbeat(self):
+        """Send periodic heartbeat pings to keep the WebSocket connection alive."""
+        while self.running:
+            try:
+                if self.ws and self.ws.open:
+                    await self.ws.ping()
+                    self.logger.debug("Sent heartbeat ping.")
+                else:
+                    self.logger.warning("WebSocket is closed. Attempting to reconnect...")
+                    await self.reconnect()
+            except Exception as e:
+                self.logger.error(f"Error in heartbeat: {e}")
+                await self.reconnect()
+            await asyncio.sleep(30)  # Ping every 30 seconds
+
+    async def disconnect(self):
+        """Gracefully disconnect the client."""
+        self.logger.info("Disconnecting the client...")
+        self.running = False
+
+        # Close WebSocket
+        if self.ws:
+            try:
+                await self.ws.close()
+                self.logger.info("WebSocket connection closed.")
+            except Exception as e:
+                self.logger.error(f"Error closing WebSocket: {e}")
+
+        # Cancel playback task
+        if self.playback_task:
+            self.playback_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.playback_task
+
+        # Cancel muxing task
+        if self.muxing_task:
+            self.muxing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.muxing_task
+
+        # Cancel video processing task
+        if self.video_processing_task:
+            self.video_processing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.video_processing_task
+
+        # Cancel dashboard task if necessary
+        # Assuming dashboard_task is stored or accessible
+        # For simplicity, it was not stored; it will be canceled in the run method.
+
+        # Close current audio segment WAV file
+        if self.current_audio_segment_wf:
+            try:
+                self.current_audio_segment_wf.close()
+                self.logger.debug("Closed current audio segment WAV file.")
+            except Exception as e:
+                self.logger.error(f"Error closing current audio segment WAV file: {e}")
+
+        # Close WAV file
+        if self.output_wav:
+            try:
+                self.output_wav.close()
+                self.logger.info("Output WAV file closed.")
+            except Exception as e:
+                self.logger.error(f"Error closing WAV file: {e}")
+
+        self.logger.info("Client disconnected successfully.")
+
+    async def shutdown(self, sig):
+        """Handle shutdown signals."""
+        self.logger.info(f"Received exit signal {sig.name}...")
+        await self.disconnect()
+
+    def test_video_writer(self):
+        """Test function to write a sample video and verify its integrity."""
+        try:
+            self.logger.info("Starting test video writer.")
+            test_video_path = 'output/video/test_video.mp4'
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Alternative codec
+            fps = 30.0
+            width = 1280
+            height = 720
+            out = cv2.VideoWriter(test_video_path, fourcc, fps, (width, height))
+            cap = cv2.VideoCapture(STREAM_URL)
+            if not cap.isOpened():
+                self.logger.error("Cannot open video stream for testing.")
+                return
+            for i in range(int(fps * 5)):  # Write 5 seconds of video
+                ret, frame = cap.read()
+                if not ret:
+                    self.logger.warning("Failed to read frame during test video writing.")
+                    break
+                out.write(frame)
+            out.release()
+            cap.release()
+            self.logger.info(f"Test video written to {test_video_path}")
+            # Verify video file
+            probe = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_format', '-show_streams', test_video_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if probe.returncode == 0 and 'moov' in probe.stdout:
+                self.logger.info("Test video is valid.")
+            else:
+                self.logger.error("Test video is invalid.")
+                self.logger.error(f"FFprobe output: {probe.stderr}")
+        except Exception as e:
+            self.logger.error(f"Error in test_video_writer: {e}")
 
     async def run_video_processing(self):
         """Run video processing within the asyncio event loop."""
@@ -807,7 +1028,7 @@ class OpenAIClient:
             while self.running:
                 # Define video writer for each segment
                 segment_output_path = f'output/video/output_video_segment_{self.subtitle_index}.mp4'
-                fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Alternative codec
 
                 out = cv2.VideoWriter(segment_output_path, fourcc, fps, (width, height))
                 if not out.isOpened():
@@ -824,9 +1045,15 @@ class OpenAIClient:
                     wf.setnchannels(AUDIO_CHANNELS)
                     wf.setsampwidth(AUDIO_SAMPLE_WIDTH)
                     wf.setframerate(AUDIO_SAMPLE_RATE)
+                    self.current_audio_segment_wf = wf  # Reference for writing translated audio
                     self.logger.debug(f"Initialized audio segment file: {audio_segment_path}")
                 except Exception as e:
                     self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
+                    # Close VideoWriter if audio segment fails
+                    out.release()
+                    self.logger.info(f"Released VideoWriter for segment {self.subtitle_index} due to audio init failure.")
+                    self.current_audio_segment_wf = None
+                    continue
 
                 frames_written = 0
                 while frame_count < segment_frames and self.running:
@@ -844,10 +1071,14 @@ class OpenAIClient:
                 out.release()
                 self.logger.info(f"Segment {self.subtitle_index} saved to {segment_output_path}. Frames written: {frames_written}")
 
+                # Add a short delay to ensure file system flush
+                time.sleep(0.5)  # 500 milliseconds
+
                 # Close the audio WAV file
                 try:
                     wf.close()
                     self.logger.debug(f"Closed audio segment file: {audio_segment_path}")
+                    self.current_audio_segment_wf = None
                 except Exception as e:
                     self.logger.error(f"Failed to close audio segment file {audio_segment_path}: {e}")
 
@@ -872,22 +1103,8 @@ class OpenAIClient:
             self.logger.error(f"Error in start_video_processing: {e}", exc_info=True)
             self.running = False
 
-    async def enqueue_muxing_job(self, job: dict):
-        """
-        Enqueue a muxing job.
-
-        :param job: Dictionary containing muxing job details.
-        """
-        try:
-            await self.muxing_queue.put(job)
-            self.logger.debug(f"Enqueued muxing job for segment {job['segment_index']}.")
-        except asyncio.QueueFull:
-            self.logger.error("Muxing queue is full. Dropping muxing job.")
-        except Exception as e:
-            self.logger.error(f"Failed to enqueue muxing job: {e}")
-
     async def run_dashboard_server(self):
-        """Run the monitoring dashboard server."""
+        """Run the real-time monitoring dashboard using aiohttp."""
         app = web.Application()
         app.add_routes([
             web.get('/', self.handle_dashboard),
@@ -953,7 +1170,10 @@ class OpenAIClient:
 
     async def metrics_endpoint(self, request):
         """Provide metrics in JSON format for the dashboard."""
-        return web.json_response(self.metrics)
+        # Convert deque to list for JSON serialization
+        serializable_metrics = self.metrics.copy()
+        serializable_metrics["processing_delays"] = list(serializable_metrics["processing_delays"])
+        return web.json_response(serializable_metrics)
 
     async def run(self):
         """Run the OpenAIClient."""
@@ -980,19 +1200,28 @@ class OpenAIClient:
         heartbeat_task = asyncio.create_task(self.heartbeat())
 
         # Start video processing
-        video_processing_task = asyncio.create_task(self.run_video_processing())
+        self.video_processing_task = asyncio.create_task(self.run_video_processing())
 
-        # Start muxing task
-        muxing_task = asyncio.create_task(self.mux_audio_video_subtitles())
+        # No need to start another muxing_task here since it's already started in __init__
 
         # Wait for all tasks to complete
         done, pending = await asyncio.wait(
-            [send_task, handle_responses_task, read_audio_task, heartbeat_task, video_processing_task, muxing_task, dashboard_task],
+            [
+                send_task,
+                handle_responses_task,
+                read_audio_task,
+                heartbeat_task,
+                self.video_processing_task,
+                dashboard_task
+            ],
             return_when=asyncio.FIRST_EXCEPTION
         )
 
+        # Cancel pending tasks
         for task in pending:
             task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     async def heartbeat(self):
         """Send periodic heartbeat pings to keep the WebSocket connection alive."""
@@ -1009,9 +1238,9 @@ class OpenAIClient:
                 await self.reconnect()
             await asyncio.sleep(30)  # Ping every 30 seconds
 
-    async def shutdown(self, sig):
-        """Handle shutdown signals."""
-        self.logger.info(f"Received exit signal {sig.name}...")
+    async def disconnect(self):
+        """Gracefully disconnect the client."""
+        self.logger.info("Disconnecting the client...")
         self.running = False
 
         # Close WebSocket
@@ -1034,6 +1263,20 @@ class OpenAIClient:
             with suppress(asyncio.CancelledError):
                 await self.muxing_task
 
+        # Cancel video processing task
+        if self.video_processing_task:
+            self.video_processing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.video_processing_task
+
+        # Close current audio segment WAV file
+        if self.current_audio_segment_wf:
+            try:
+                self.current_audio_segment_wf.close()
+                self.logger.debug("Closed current audio segment WAV file.")
+            except Exception as e:
+                self.logger.error(f"Error closing current audio segment WAV file: {e}")
+
         # Close WAV file
         if self.output_wav:
             try:
@@ -1042,14 +1285,19 @@ class OpenAIClient:
             except Exception as e:
                 self.logger.error(f"Error closing WAV file: {e}")
 
-        self.logger.info("Shutdown complete.")
+        self.logger.info("Client disconnected successfully.")
+
+    async def shutdown(self, sig):
+        """Handle shutdown signals."""
+        self.logger.info(f"Received exit signal {sig.name}...")
+        await self.disconnect()
 
     def test_video_writer(self):
         """Test function to write a sample video and verify its integrity."""
         try:
             self.logger.info("Starting test video writer.")
             test_video_path = 'output/video/test_video.mp4'
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Alternative codec
             fps = 30.0
             width = 1280
             height = 720
@@ -1082,3 +1330,116 @@ class OpenAIClient:
         except Exception as e:
             self.logger.error(f"Error in test_video_writer: {e}")
 
+    async def run_video_processing(self):
+        """Run video processing within the asyncio event loop."""
+        await asyncio.to_thread(self.start_video_processing)
+
+    def start_video_processing(self):
+        """Start video processing with OpenCV and dynamic subtitle overlay."""
+        try:
+            self.logger.info("Starting video processing with OpenCV.")
+
+            # Open video capture
+            cap = cv2.VideoCapture(STREAM_URL)
+
+            if not cap.isOpened():
+                self.logger.error("Cannot open video stream.")
+                self.running = False
+                return
+
+            # Get video properties
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps == 0 or fps is None:
+                fps = 30.0  # Default FPS if unable to get from stream
+                self.logger.warning(f"Unable to get FPS from stream. Defaulting to {fps} FPS.")
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+
+            self.logger.info(f"Video properties - FPS: {fps}, Width: {width}, Height: {height}")
+
+            # Initialize variables for video segmentation
+            segment_duration = 10  # seconds
+            segment_frames = int(fps * segment_duration)
+            frame_count = 0
+            self.segment_start_time = time.perf_counter()
+
+            if self.video_start_time is None:
+                self.video_start_time = self.segment_start_time
+
+            while self.running:
+                # Define video writer for each segment
+                segment_output_path = f'output/video/output_video_segment_{self.subtitle_index}.mp4'
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Alternative codec
+
+                out = cv2.VideoWriter(segment_output_path, fourcc, fps, (width, height))
+                if not out.isOpened():
+                    self.logger.error(f"Failed to open VideoWriter for segment {self.subtitle_index}.")
+                    self.running = False
+                    break
+
+                self.logger.info(f"Started recording segment {self.subtitle_index} to {segment_output_path}")
+
+                # Initialize the corresponding audio segment file
+                audio_segment_path = f'output/audio/output_audio_segment_{self.subtitle_index}.wav'
+                try:
+                    wf = wave.open(audio_segment_path, 'wb')
+                    wf.setnchannels(AUDIO_CHANNELS)
+                    wf.setsampwidth(AUDIO_SAMPLE_WIDTH)
+                    wf.setframerate(AUDIO_SAMPLE_RATE)
+                    self.current_audio_segment_wf = wf  # Reference for writing translated audio
+                    self.logger.debug(f"Initialized audio segment file: {audio_segment_path}")
+                except Exception as e:
+                    self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
+                    # Close VideoWriter if audio segment fails
+                    out.release()
+                    self.logger.info(f"Released VideoWriter for segment {self.subtitle_index} due to audio init failure.")
+                    self.current_audio_segment_wf = None
+                    continue
+
+                frames_written = 0
+                while frame_count < segment_frames and self.running:
+                    ret, frame = cap.read()
+                    if not ret:
+                        self.logger.warning("Failed to read frame from video stream.")
+                        break
+                    out.write(frame)
+                    frame_count += 1
+                    frames_written += 1
+                    if frames_written % int(fps) == 0:
+                        self.logger.debug(f"Written {frames_written} frames to segment {self.subtitle_index}.")
+
+                # Release the video writer
+                out.release()
+                self.logger.info(f"Segment {self.subtitle_index} saved to {segment_output_path}. Frames written: {frames_written}")
+
+                # Add a short delay to ensure file system flush
+                time.sleep(0.5)  # 500 milliseconds
+
+                # Close the audio WAV file
+                try:
+                    wf.close()
+                    self.logger.debug(f"Closed audio segment file: {audio_segment_path}")
+                    self.current_audio_segment_wf = None
+                except Exception as e:
+                    self.logger.error(f"Failed to close audio segment file {audio_segment_path}: {e}")
+
+                # Enqueue muxing job
+                final_output_path = f'output/final/output_final_video_segment_{self.subtitle_index}.mp4'
+                muxing_job = {
+                    "segment_index": self.subtitle_index,
+                    "video": segment_output_path,
+                    "audio": audio_segment_path,
+                    "subtitles": SUBTITLE_PATH,
+                    "output": final_output_path
+                }
+                # Enqueue muxing job in a thread-safe manner
+                asyncio.run_coroutine_threadsafe(self.enqueue_muxing_job(muxing_job), self.loop)
+
+                # Reset for next segment
+                self.subtitle_index += 1
+                frame_count = 0
+                self.segment_start_time = time.perf_counter()
+
+        except Exception as e:
+            self.logger.error(f"Error in start_video_processing: {e}", exc_info=True)
+            self.running = False
