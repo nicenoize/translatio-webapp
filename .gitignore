@@ -24,3 +24,5 @@ output/debug/audio/
 *.srt
 
 *.mp4
+
+output/logs/

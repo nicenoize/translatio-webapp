@@ -1,3 +1,5 @@
+# main.py
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -9,11 +11,12 @@ from dotenv import load_dotenv
 import signal
 import logging
 from logging.handlers import RotatingFileHandler
+from typing import Optional
 
-
+# Load environment variables
 load_dotenv()
 
-from stream_processor.openai_client import OpenAIClient  # Ensure correct import path
+from openai_client.client import OpenAIClient  # Updated import path
 
 app = FastAPI()
 
@@ -30,7 +33,7 @@ STREAM_URLS = {
 }
 
 # Global reference to the processor
-processor = None
+processor: Optional[OpenAIClient] = None
 should_exit = False
 
 # Initialize a logger for main.py
@@ -38,6 +41,7 @@ main_logger = logging.getLogger("main")
 main_logger.setLevel(logging.DEBUG)
 
 # Add RotatingFileHandler for main.log
+os.makedirs("output/logs", exist_ok=True)
 app_handler = RotatingFileHandler("output/logs/main.log", maxBytes=5*1024*1024, backupCount=5)
 app_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 app_handler.setFormatter(app_formatter)
@@ -60,7 +64,7 @@ async def shutdown_event():
     global processor, should_exit
     should_exit = True
     if processor:
-        await processor.disconnect(shutdown=True)
+        await processor.disconnect()
 
 def signal_handler():
     asyncio.create_task(shutdown_event())
@@ -70,21 +74,18 @@ async def startup_event():
     global processor
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
+        main_logger.error("OPENAI_API_KEY environment variable not set")
         raise ValueError("OPENAI_API_KEY environment variable not set")
         
+    # Example stream and output URLs; adjust as needed
     stream_url = "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t"
     output_rtmp_url = "rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live"
 
-    # Get the current event loop
-    loop = asyncio.get_running_loop()
-
-    # Initialize OpenAIClient with the event loop
-    processor = OpenAIClient(
-        api_key=api_key,
-        loop=loop
-    )
+    # Initialize OpenAIClient
+    processor = OpenAIClient(api_key=api_key)
     
     # Set up signal handlers
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, signal_handler)
@@ -103,7 +104,11 @@ async def shutdown():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
-    # Register the WebSocket client
+    if not processor:
+        main_logger.error("Processor is not initialized.")
+        await websocket.close()
+        return
+
     try:
         client_id = await processor.register_websocket(websocket)
     except Exception as e:
@@ -120,7 +125,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         main_logger.error(f"WebSocket error: {e}")
     finally:
-        # Unregister the WebSocket client when the connection is closed
         await processor.unregister_websocket(client_id)
 
 if __name__ == "__main__":
