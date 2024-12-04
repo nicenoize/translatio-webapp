@@ -16,9 +16,10 @@ class Muxer:
         self.muxing_task = asyncio.create_task(self.mux_audio_video_subtitles())
         # Track processed segments in Muxer
         self.processed_segments = set()
+        self.expected_segments = set(range(1, 5))  # work with 5 segments for now (later without max)
+
 
     async def enqueue_muxing_job(self, job: Dict):
-        """Enqueue a muxing job to the muxing_queue."""
         segment_index = job["segment_index"]
         try:
             if segment_index in self.processed_segments:
@@ -26,10 +27,13 @@ class Muxer:
                 return
             self.processed_segments.add(segment_index)
             await self.muxing_queue.put(job)
+            self.logger.info(f"Enqueued muxing job for segment {segment_index}")
         except asyncio.QueueFull:
             self.logger.error("Muxing queue is full. Failed to enqueue muxing job.")
         except Exception as e:
             self.logger.error(f"Failed to enqueue muxing job: {e}")
+
+
 
     async def mux_audio_video_subtitles(self):
         """Asynchronous task to mux audio, video, and subtitles."""
@@ -41,13 +45,18 @@ class Muxer:
                     self.logger.info("Muxing queue received shutdown signal.")
                     break
 
-                video_path = job['video']
+                original_video_path = job['video']
                 audio_path = job['audio']
                 final_output_path = job['output']
                 segment_index = job['segment_index']
                 audio_offset = job.get('audio_offset', 0.0)
 
-                self.logger.info(f"Muxing audio and video for segment {segment_index}.")
+                # Use the previous segment's video if it exists
+                previous_segment_index = segment_index - 1
+                fallback_video_path = f'output/video/output_video_segment_{previous_segment_index}.mp4'
+                video_path = fallback_video_path if os.path.exists(fallback_video_path) else original_video_path
+
+                self.logger.info(f"Using video for segment {segment_index}: {video_path}")
 
                 # Validate file existence
                 if not self.validate_files(video_path, audio_path, segment_index):
@@ -75,6 +84,7 @@ class Muxer:
 
             except Exception as e:
                 self.logger.error(f"Error in mux_audio_video_subtitles: {e}")
+
 
     def validate_files(self, video_path: str, audio_path: str, segment_index: int) -> bool:
         """Validate video and audio files for muxing."""
@@ -129,16 +139,19 @@ class Muxer:
                 caption for caption in subs if segment_start_time <= self.vtt_timestamp_to_seconds(caption.start) < segment_end_time
             ]
 
+            new_vtt = webvtt.WebVTT()
             if segment_subs:
-                new_vtt = webvtt.WebVTT()
                 for caption in segment_subs:
                     new_vtt.captions.append(caption)
-                new_vtt.save(output_path)
                 self.logger.info(f"Extracted subtitles for segment {segment_index}.")
             else:
-                self.logger.warning(f"No subtitles found for segment {segment_index}.")
+                self.logger.warning(f"No subtitles found for segment {segment_index}. Generating empty subtitle file.")
+
+            new_vtt.save(output_path)
+
         except Exception as e:
             self.logger.error(f"Error extracting subtitles for segment {segment_index}: {e}")
+
 
     def run_ffmpeg_command(self, video_path: str, audio_path: str, subtitles_path: str, output_path: str, segment_index: int, audio_offset: float = 0.0):
         """Run FFmpeg command to mux video, audio, and optionally subtitles."""
@@ -151,8 +164,8 @@ class Muxer:
             subtitles_path = f"output/subtitles/subtitles_segment_{segment_index}.vtt"
             command = [
                 'ffmpeg', '-y',
-                '-i', video_path,  # Video input
-                '-itsoffset', str(audio_offset), '-i', audio_path,  # Apply audio offset
+                '-itsoffset', str(video_delay), '-i', video_path,  # Apply delay to video
+                '-itsoffset', str(audio_offset), '-i', audio_path,  # Apply offset to audio
                 '-c:v', 'libx264',
                 '-c:a', 'aac',
                 '-strict', 'experimental'

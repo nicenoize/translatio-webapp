@@ -133,10 +133,12 @@ class OpenAIClient:
             return self.segment_index
 
     async def increment_segment_index(self):
-        """Safely increment the segment index."""
         async with self.segment_index_lock:
+            old_index = self.segment_index
             self.segment_index += 1
-            self.logger.info(f"Incremented segment_index to {self.segment_index}")
+            self.logger.info(f"Segment index incremented from {old_index} to {self.segment_index}")
+            assert self.segment_index > old_index, "Segment index did not increment correctly!"
+
 
     async def initialize_temp_subtitles(self, segment_index: int):
         """Initialize a temporary WebVTT subtitle file for the given segment."""
@@ -418,6 +420,7 @@ class OpenAIClient:
                 await self.handle_function_call(item)
 
         elif event_type == "response.audio.delta":
+            self.logger.debug("Audio delta detected: %s", event)
             audio_data = event.get("delta", "")
             if audio_data:
                 await self.audio_processor.handle_audio_delta(audio_data)

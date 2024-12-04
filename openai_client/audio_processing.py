@@ -81,7 +81,6 @@ class AudioProcessor:
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
             play_obj = sa.play_buffer(audio_array, AUDIO_CHANNELS, AUDIO_SAMPLE_WIDTH, AUDIO_SAMPLE_RATE)
             await asyncio.to_thread(play_obj.wait_done)
-            self.logger.debug("Played translated audio chunk.")
 
             # Buffer and manage segment sizes
             async with self.segment_lock:
@@ -92,27 +91,25 @@ class AudioProcessor:
                 self.client.segment_audio_buffer.extend(audio_data)
 
                 # Determine required bytes for a segment
-                bytes_per_second = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH
-                segment_size_bytes = int(AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH * SEGMENT_DURATION)
-                
+                segment_size_bytes = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH * SEGMENT_DURATION
+
                 # Write full segments to files
                 while len(self.client.segment_audio_buffer) >= segment_size_bytes:
                     segment_data = self.client.segment_audio_buffer[:segment_size_bytes]
                     self.client.segment_audio_buffer = self.client.segment_audio_buffer[segment_size_bytes:]
 
-                    # Write to current segment WAV file
                     if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
                         self.client.current_audio_segment_wf.writeframes(segment_data)
-                        self.logger.debug(f"Written segment of size {segment_size_bytes} bytes to current segment WAV file.")
+                        self.logger.debug(f"Written segment of size {segment_size_bytes} bytes to audio segment WAV file.")
                     else:
                         self.logger.warning("No current audio segment WAV file to write to.")
-            
-            # Write to output WAV
-            if self.client.output_wav:
-                self.client.output_wav.writeframes(audio_data)
-                self.logger.debug("Written translated audio chunk to output WAV file.")
-            else:
-                self.logger.warning("Output WAV file is not initialized.")
+                
+                # Write to output WAV
+                if self.client.output_wav:
+                    self.client.output_wav.writeframes(audio_data)
+                    self.logger.debug("Written translated audio chunk to output WAV file.")
+                else:
+                    self.logger.warning("Output WAV file is not initialized.")
 
         except Exception as e:
             self.logger.error(f"Error playing or buffering audio: {e}")
