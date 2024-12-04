@@ -140,6 +140,16 @@ class VideoProcessor:
                     "subtitles": f'output/subtitles/subtitles_segment_{current_segment_index}.vtt',
                     "output": final_output_path
                 }
+
+                # Track already processed segments
+                self.processed_segments = set()
+
+                # Before enqueuing a job
+                if current_segment_index in self.processed_segments:
+                    self.logger.warning(f"Segment {current_segment_index} is already processed. Skipping duplicate job.")
+                    continue
+
+                self.processed_segments.add(current_segment_index)
                 # Enqueue muxing job in a thread-safe manner
                 asyncio.run_coroutine_threadsafe(
                     self.client.muxer.enqueue_muxing_job(muxing_job),

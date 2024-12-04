@@ -14,12 +14,18 @@ class Muxer:
         self.logger = logger
         self.muxing_queue = asyncio.Queue(maxsize=self.client.MUXING_QUEUE_MAXSIZE)
         self.muxing_task = asyncio.create_task(self.mux_audio_video_subtitles())
+        # Track processed segments in Muxer
+        self.processed_segments = set()
 
     async def enqueue_muxing_job(self, job: Dict):
         """Enqueue a muxing job to the muxing_queue."""
+        segment_index = job["segment_index"]
         try:
+            if segment_index in self.processed_segments:
+                self.logger.warning(f"Segment {segment_index} already processed. Skipping.")
+                return
+            self.processed_segments.add(segment_index)
             await self.muxing_queue.put(job)
-            self.logger.debug(f"Enqueued muxing job for segment {job.get('segment_index')}.")
         except asyncio.QueueFull:
             self.logger.error("Muxing queue is full. Failed to enqueue muxing job.")
         except Exception as e:
@@ -39,6 +45,7 @@ class Muxer:
                 audio_path = job['audio']
                 final_output_path = job['output']
                 segment_index = job['segment_index']
+                audio_offset = job.get('audio_offset', 0.0)
 
                 self.logger.info(f"Muxing audio and video for segment {segment_index}.")
 
@@ -58,7 +65,7 @@ class Muxer:
                 self.extract_subtitles_for_segment(segment_index, temp_subtitles_path)
 
                 # FFmpeg muxing
-                self.run_ffmpeg_command(video_path, audio_path, temp_subtitles_path, final_output_path, segment_index)
+                self.run_ffmpeg_command(video_path, audio_path, temp_subtitles_path, final_output_path, segment_index, audio_offset)
 
                 # Clean up temporary files
                 if os.path.exists(temp_subtitles_path):
@@ -85,6 +92,7 @@ class Muxer:
         except Exception as e:
             self.logger.error(f"Error validating files for segment {segment_index}: {e}")
             return False
+
 
     def check_duration_match(self, video_path: str, audio_path: str) -> bool:
         """Check if video and audio durations match closely."""
@@ -132,27 +140,60 @@ class Muxer:
         except Exception as e:
             self.logger.error(f"Error extracting subtitles for segment {segment_index}: {e}")
 
-    def run_ffmpeg_command(self, video_path: str, audio_path: str, subtitles_path: str, output_path: str, segment_index: int):
+    def run_ffmpeg_command(self, video_path: str, audio_path: str, subtitles_path: str, output_path: str, segment_index: int, audio_offset: float = 0.0):
         """Run FFmpeg command to mux video, audio, and optionally subtitles."""
         try:
+            # Define offset log file
+            offset_log_file = "output/logs/audio_offsets.log"
+            os.makedirs(os.path.dirname(offset_log_file), exist_ok=True)
+            
+            # Prepare FFmpeg command
+            subtitles_path = f"output/subtitles/subtitles_segment_{segment_index}.vtt"
             command = [
-                'ffmpeg', '-y', '-i', video_path, '-i', audio_path, '-c:v', 'libx264', '-c:a', 'aac', '-strict', 'experimental'
+                'ffmpeg', '-y',
+                '-i', video_path,  # Video input
+                '-itsoffset', str(audio_offset), '-i', audio_path,  # Apply audio offset
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-strict', 'experimental'
             ]
 
+            # Add subtitles if they exist
             if os.path.exists(subtitles_path):
                 command.extend(['-vf', f"subtitles={subtitles_path}:force_style='FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF&'"])
 
+            # Map video and offset audio streams
+            command.extend(['-map', '0:v', '-map', '1:a'])
             command.append(output_path)
 
+            # Log the FFmpeg command
             self.logger.debug(f"Running FFmpeg command: {' '.join(command)}")
+
+            # Execute FFmpeg command
             process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+            # Log offset-specific details
+            with open(offset_log_file, 'a') as log_file:
+                log_entry = (
+                    f"Segment: {segment_index}, "
+                    f"Video: {video_path}, "
+                    f"Audio: {audio_path}, "
+                    f"Offset: {audio_offset:.2f}, "
+                    f"Output: {output_path}, "
+                    f"Return Code: {process.returncode}\n"
+                )
+                log_file.write(log_entry)
+
+            # Check FFmpeg result
             if process.returncode == 0:
                 self.logger.info(f"Successfully muxed segment {segment_index}. Output: {output_path}")
             else:
                 self.logger.error(f"FFmpeg failed for segment {segment_index}. Error: {process.stderr}")
         except Exception as e:
             self.logger.error(f"Error running FFmpeg for segment {segment_index}: {e}")
+
+
+
 
     def vtt_timestamp_to_seconds(self, timestamp: str) -> float:
         """Convert VTT timestamp to seconds."""

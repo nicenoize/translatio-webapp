@@ -204,6 +204,11 @@ class OpenAIClient:
 
         current_time = datetime.datetime.utcnow().isoformat()
         processing_delay = self.processing_delays[-1]
+        cumulative_delay = sum(self.processing_delays)
+
+        # Save cumulative delay for each segment in the job
+        self.current_cumulative_delay = cumulative_delay
+
         average_delay = statistics.mean(self.processing_delays)
         min_delay = min(self.processing_delays)
         max_delay = max(self.processing_delays)
@@ -215,6 +220,7 @@ class OpenAIClient:
         self.metrics["min_processing_delay"] = min_delay
         self.metrics["max_processing_delay"] = max_delay
         self.metrics["stddev_processing_delay"] = stddev_delay
+        self.metrics["cumulative_delay"] = cumulative_delay  # Add cumulative delay
         self.metrics["buffer_status"] = len(self.audio_buffer)
         self.metrics["audio_queue_size"] = self.audio_processor.translated_audio_queue.qsize()
         self.metrics["muxing_queue_size"] = self.muxer.muxing_queue.qsize()
@@ -225,6 +231,7 @@ class OpenAIClient:
                 await writer.writerow([
                     current_time,
                     f"{processing_delay:.6f}",
+                    f"{cumulative_delay:.6f}",
                     f"{average_delay:.6f}",
                     f"{min_delay:.6f}",
                     f"{max_delay:.6f}",
@@ -233,6 +240,7 @@ class OpenAIClient:
             self.logger.debug("Delay metrics logged.")
         except Exception as e:
             self.logger.error(f"Failed to log delay metrics: {e}")
+
 
     async def connect(self):
         """Establish WebSocket connection to Realtime API."""
@@ -453,7 +461,8 @@ class OpenAIClient:
                     "video": f'output/video/output_video_segment_{self.segment_index}.mp4',
                     "audio": f'output/audio/output_audio_segment_{self.segment_index}.wav',
                     "subtitles": f'output/subtitles/subtitles_segment_{self.segment_index}.vtt',
-                    "output": f'output/final/output_final_segment_{self.segment_index}.mp4'
+                    "output": f'output/final/output_final_segment_{self.segment_index}.mp4',
+                    "audio_offset": self.metrics.get("processing_delay", 0.0)  # Default to 0 if no delay recorded
                 }
                 await self.enqueue_muxing_job(muxing_job)
                 self.logger.info(f"Enqueued muxing job for segment {self.segment_index}")

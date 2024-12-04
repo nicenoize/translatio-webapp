@@ -26,3 +26,5 @@ output/debug/audio/
 *.mp4
 
 output/logs/
+
+output/subtitles/
