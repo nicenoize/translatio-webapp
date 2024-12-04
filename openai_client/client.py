@@ -472,7 +472,7 @@ class OpenAIClient:
                 await self.audio_processor.close_current_audio_segment(self.segment_index)
 
                 # Increment segment_index for the next segment
-                await self.increment_segment_index()
+                # await self.increment_segment_index()
 
                 # Initialize subtitle file for the next segment
                 await self.initialize_temp_subtitles(self.segment_index)

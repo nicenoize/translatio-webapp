@@ -53,11 +53,10 @@ class VideoProcessor:
 
             while self.client.running:
                 # Retrieve current segment_index safely
-                loop = self.client.loop
                 try:
                     current_segment_index_future = asyncio.run_coroutine_threadsafe(
                         self.client.get_segment_index(),
-                        loop
+                        self.client.loop
                     )
                     current_segment_index = current_segment_index_future.result()
                 except Exception as e:
@@ -67,7 +66,7 @@ class VideoProcessor:
 
                 # Define video writer for each segment
                 segment_output_path = f'output/video/output_video_segment_{current_segment_index}.mp4'
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Alternative codec
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 
                 out = cv2.VideoWriter(segment_output_path, fourcc, fps, (width, height))
                 if not out.isOpened():
@@ -85,13 +84,11 @@ class VideoProcessor:
                     wf.setnchannels(self.client.AUDIO_CHANNELS)
                     wf.setsampwidth(self.client.AUDIO_SAMPLE_WIDTH)
                     wf.setframerate(self.client.AUDIO_SAMPLE_RATE)
-                    self.client.current_audio_segment_wf = wf  # Reference for writing translated audio
+                    self.client.current_audio_segment_wf = wf
                     self.logger.debug(f"Initialized audio segment file: {audio_segment_path}")
                 except Exception as e:
                     self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
-                    # Close VideoWriter if audio segment fails
                     out.release()
-                    self.logger.info(f"Released VideoWriter for segment {current_segment_index} due to audio init failure.")
                     self.client.current_audio_segment_wf = None
                     continue
 
@@ -111,9 +108,6 @@ class VideoProcessor:
                 out.release()
                 self.logger.info(f"Segment {current_segment_index} saved to {segment_output_path}. Frames written: {frames_written}")
 
-                # Introduce a small delay to ensure file system has completed writing
-                time.sleep(2)  # 2 seconds
-
                 # Log file sizes
                 try:
                     video_size = os.path.getsize(segment_output_path)
@@ -126,8 +120,8 @@ class VideoProcessor:
                 # Close the audio WAV file
                 try:
                     wf.close()
-                    self.logger.debug(f"Closed audio segment file: {audio_segment_path}")
                     self.client.current_audio_segment_wf = None
+                    self.logger.debug(f"Closed audio segment file: {audio_segment_path}")
                 except Exception as e:
                     self.logger.error(f"Failed to close audio segment file {audio_segment_path}: {e}")
 
@@ -140,17 +134,6 @@ class VideoProcessor:
                     "subtitles": f'output/subtitles/subtitles_segment_{current_segment_index}.vtt',
                     "output": final_output_path
                 }
-
-                # Track already processed segments
-                self.processed_segments = set()
-
-                # Before enqueuing a job
-                if current_segment_index in self.processed_segments:
-                    self.logger.warning(f"Segment {current_segment_index} is already processed. Skipping duplicate job.")
-                    continue
-
-                self.processed_segments.add(current_segment_index)
-                # Enqueue muxing job in a thread-safe manner
                 asyncio.run_coroutine_threadsafe(
                     self.client.muxer.enqueue_muxing_job(muxing_job),
                     self.client.loop
@@ -159,6 +142,18 @@ class VideoProcessor:
                 # Reset for next segment
                 frame_count = 0
                 self.segment_start_time = time.perf_counter()
+
+                # Increment the segment index
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.client.increment_segment_index(),
+                        self.client.loop
+                    ).result()
+                    self.logger.info(f"Moved to next segment index: {current_segment_index + 1}")
+                except Exception as e:
+                    self.logger.error(f"Error incrementing segment index: {e}")
+                    self.client.running = False
+                    break
 
         except Exception as e:
             self.logger.error(f"Error in start_video_processing: {e}", exc_info=True)
