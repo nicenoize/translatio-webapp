@@ -202,40 +202,38 @@ class OpenAIClient:
             self.logger.debug("No processing delays to log.")
             return
 
-        current_time = datetime.datetime.utcnow().isoformat()
-        processing_delay = self.processing_delays[-1]
-        cumulative_delay = sum(self.processing_delays)
+        processing_delay = self.processing_delays[-1]  # Use the last processing delay
+        buffer = 0.5  # Add a small buffer for seamless video/audio sync
+        offset = processing_delay + buffer  # Final offset for the audio
+        
+        # Log the processing delay and offset
+        self.logger.info(f"Processing delay: {processing_delay:.6f}s, Audio Offset: {offset:.6f}s")
 
-        # Save cumulative delay for each segment in the job
-        self.current_cumulative_delay = cumulative_delay
-
-        average_delay = statistics.mean(self.processing_delays)
-        min_delay = min(self.processing_delays)
-        max_delay = max(self.processing_delays)
-        stddev_delay = statistics.stdev(self.processing_delays) if len(self.processing_delays) > 1 else 0.0
-
-        # Update monitoring metrics
+        # Update metrics
         self.metrics["processing_delays"].append(processing_delay)
-        self.metrics["average_processing_delay"] = average_delay
-        self.metrics["min_processing_delay"] = min_delay
-        self.metrics["max_processing_delay"] = max_delay
-        self.metrics["stddev_processing_delay"] = stddev_delay
-        self.metrics["cumulative_delay"] = cumulative_delay  # Add cumulative delay
+        self.metrics["average_processing_delay"] = statistics.mean(self.processing_delays)
+        self.metrics["min_processing_delay"] = min(self.processing_delays)
+        self.metrics["max_processing_delay"] = max(self.processing_delays)
+        self.metrics["stddev_processing_delay"] = (
+            statistics.stdev(self.processing_delays) if len(self.processing_delays) > 1 else 0.0
+        )
         self.metrics["buffer_status"] = len(self.audio_buffer)
         self.metrics["audio_queue_size"] = self.audio_processor.translated_audio_queue.qsize()
         self.metrics["muxing_queue_size"] = self.muxer.muxing_queue.qsize()
 
         try:
+            # Save metrics to the CSV for later analysis
+            current_time = datetime.datetime.utcnow().isoformat()
             async with aiofiles.open(self.delay_benchmark_file, 'a', newline='') as csv_file:
                 writer = csv.writer(csv_file)
                 await writer.writerow([
                     current_time,
                     f"{processing_delay:.6f}",
-                    f"{cumulative_delay:.6f}",
-                    f"{average_delay:.6f}",
-                    f"{min_delay:.6f}",
-                    f"{max_delay:.6f}",
-                    f"{stddev_delay:.6f}"
+                    f"{offset:.6f}",  # Log the calculated offset
+                    f"{self.metrics['average_processing_delay']:.6f}",
+                    f"{self.metrics['min_processing_delay']:.6f}",
+                    f"{self.metrics['max_processing_delay']:.6f}",
+                    f"{self.metrics['stddev_processing_delay']:.6f}"
                 ])
             self.logger.debug("Delay metrics logged.")
         except Exception as e:
@@ -454,6 +452,9 @@ class OpenAIClient:
 
                 # Write subtitle to temporary WebVTT file
                 await self.write_vtt_subtitle(self.segment_index, start_time, end_time, transcript)
+                processing_delay = self.processing_delays[-1]  # Use the last processing delay
+                buffer = 0.5  # Add a small buffer for seamless video/audio sync
+                audio_offset = processing_delay + buffer
 
                 # Enqueue muxing job
                 muxing_job = {
@@ -462,7 +463,7 @@ class OpenAIClient:
                     "audio": f'output/audio/output_audio_segment_{self.segment_index}.wav',
                     "subtitles": f'output/subtitles/subtitles_segment_{self.segment_index}.vtt',
                     "output": f'output/final/output_final_segment_{self.segment_index}.mp4',
-                    "audio_offset": self.metrics.get("processing_delay", 0.0)  # Default to 0 if no delay recorded
+                    "audio_offset": audio_offset  # Default to 0 if no delay recorded
                 }
                 await self.enqueue_muxing_job(muxing_job)
                 self.logger.info(f"Enqueued muxing job for segment {self.segment_index}")

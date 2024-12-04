@@ -142,11 +142,11 @@ class Muxer:
 
     def run_ffmpeg_command(self, video_path: str, audio_path: str, subtitles_path: str, output_path: str, segment_index: int, audio_offset: float = 0.0):
         """Run FFmpeg command to mux video, audio, and optionally subtitles."""
-        try:
-            # Define offset log file
-            offset_log_file = "output/logs/audio_offsets.log"
-            os.makedirs(os.path.dirname(offset_log_file), exist_ok=True)
+        # Define offset log file
+        offset_log_file = "output/logs/audio_offsets.log"
+        os.makedirs(os.path.dirname(offset_log_file), exist_ok=True)
             
+        try:
             # Prepare FFmpeg command
             subtitles_path = f"output/subtitles/subtitles_segment_{segment_index}.vtt"
             command = [
@@ -173,7 +173,7 @@ class Muxer:
             process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
             # Log offset-specific details
-            with open(offset_log_file, 'a') as log_file:
+            with open("output/logs/audio_offsets.log", 'a') as log_file:
                 log_entry = (
                     f"Segment: {segment_index}, "
                     f"Video: {video_path}, "
@@ -191,8 +191,6 @@ class Muxer:
                 self.logger.error(f"FFmpeg failed for segment {segment_index}. Error: {process.stderr}")
         except Exception as e:
             self.logger.error(f"Error running FFmpeg for segment {segment_index}: {e}")
-
-
 
 
     def vtt_timestamp_to_seconds(self, timestamp: str) -> float:
