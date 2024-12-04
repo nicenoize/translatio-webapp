@@ -26,5 +26,5 @@ FEMALE_VOICE_ID = "coral"
 DEFAULT_VOICE_ID = "alloy"
 
 # Other Configurations
-SEGMENT_DURATION = 10  # seconds
+SEGMENT_DURATION = 5  # seconds
 MAX_BACKOFF = 60       # seconds for reconnection attempts

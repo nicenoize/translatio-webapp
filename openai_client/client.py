@@ -73,7 +73,7 @@ class OpenAIClient:
         self.video_start_time = None
 
         # Subtitle Management
-        self.subtitle_index = 1
+        self.segment_index = 1  # Changed from subtitle_index
 
         # Initialize output WAV file
         self.output_wav = None
@@ -388,8 +388,8 @@ class OpenAIClient:
                 self.processing_delays.append(processing_delay)
                 await self.log_delay_metrics()
 
-                await self.write_vtt_subtitle(self.subtitle_index, start_time, end_time, transcript)
-                self.subtitle_index += 1
+                await self.write_vtt_subtitle(self.segment_index, start_time, end_time, transcript)
+                self.segment_index += 1  # Increment segment_index after writing subtitle
             else:
                 self.logger.warning("No sent audio timestamp available for transcript.")
                 # Optionally, assign default timings or skip
@@ -489,18 +489,22 @@ class OpenAIClient:
         """Create a response to trigger audio generation with dynamic voice selection."""
         async with self.response_lock:
             # Path to the latest audio segment for gender detection
-            latest_audio_segment = f'output/audio/output_audio_segment_{self.subtitle_index - 1}.wav'
+            latest_audio_segment = f'output/audio/output_audio_segment_{self.segment_index - 1}.wav'
 
-            # Detect gender
-            gender = self.predict_gender(latest_audio_segment)
-            if gender == 'male':
-                selected_voice = self.MALE_VOICE_ID  # Replace with actual voice identifier for male
-            elif gender == 'female':
-                selected_voice = self.FEMALE_VOICE_ID  # Replace with actual voice identifier for female
-            else:
-                selected_voice = self.DEFAULT_VOICE_ID  # Default voice
 
-            self.logger.info(f"Detected gender: {gender}. Selected voice: {selected_voice}")
+            # Disable for error fixing
+            # # Detect gender
+            # gender = self.predict_gender(latest_audio_segment)
+            # if gender == 'male':
+            #     selected_voice = self.MALE_VOICE_ID  # Replace with actual voice identifier for male
+            # elif gender == 'female':
+            #     selected_voice = self.FEMALE_VOICE_ID  # Replace with actual voice identifier for female
+            # else:
+            #     selected_voice = self.DEFAULT_VOICE_ID  # Default voice
+
+            selected_voice = self.MALE_VOICE_ID
+
+            # self.logger.info(f"Detected gender: {gender}. Selected voice: {selected_voice}")
 
             response_event = {
                 "type": "response.create",

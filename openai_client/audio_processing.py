@@ -11,8 +11,9 @@ import numpy as np
 import logging
 from typing import Optional
 from .utils import format_timestamp_vtt
-from config import AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_WIDTH
+from config import AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_WIDTH, SEGMENT_DURATION
 from collections import deque
+
 
 class AudioProcessor:
     def __init__(self, client, logger: logging.Logger):
@@ -21,6 +22,7 @@ class AudioProcessor:
         self.translated_audio_queue = Queue()
         self.playback_task = asyncio.create_task(self.audio_playback_handler())
         self.audio_buffer = deque(maxlen=100)
+        self.segment_lock = asyncio.Lock()  # To synchronize access to segments
 
     async def handle_audio_delta(self, audio_data: str):
         """Handle incoming audio delta from the server."""
@@ -33,6 +35,7 @@ class AudioProcessor:
             # Save raw audio for verification
             response_audio_filename = f"{uuid.uuid4()}.wav"
             response_audio_path = os.path.join('output/audio/responses', response_audio_filename)
+            os.makedirs(os.path.dirname(response_audio_path), exist_ok=True)
             with wave.open(response_audio_path, 'wb') as wf_response:
                 wf_response.setnchannels(AUDIO_CHANNELS)
                 wf_response.setsampwidth(AUDIO_SAMPLE_WIDTH)
@@ -84,11 +87,50 @@ class AudioProcessor:
             if self.client.output_wav:
                 self.client.output_wav.writeframes(audio_data)
                 self.logger.debug("Written translated audio chunk to output WAV file.")
+            else:
+                self.logger.warning("Output WAV file is not initialized.")
 
             # Write to current audio segment WAV
-            if self.client.current_audio_segment_wf:
-                self.client.current_audio_segment_wf.writeframes(audio_data)
-                self.logger.debug("Written translated audio chunk to current audio segment WAV file.")
+            async with self.segment_lock:
+                if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
+                    self.client.current_audio_segment_wf.writeframes(audio_data)
+                    self.logger.debug("Written translated audio chunk to current audio segment WAV file.")
+                else:
+                    self.logger.warning("No current audio segment WAV file to write to.")
 
         except Exception as e:
             self.logger.error(f"Error playing audio: {e}")
+
+    async def start_new_audio_segment(self, segment_index: int):
+        """Initialize a new audio segment WAV file for the given segment index."""
+        async with self.segment_lock:
+            try:
+                audio_segment_path = f'output/audio/output_audio_segment_{segment_index}.wav'
+                os.makedirs(os.path.dirname(audio_segment_path), exist_ok=True)
+                wf = wave.open(audio_segment_path, 'wb')
+                wf.setnchannels(AUDIO_CHANNELS)
+                wf.setsampwidth(AUDIO_SAMPLE_WIDTH)
+                wf.setframerate(AUDIO_SAMPLE_RATE)
+                self.client.current_audio_segment_wf = wf
+                self.logger.info(f"Initialized new audio segment file: {audio_segment_path}")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize audio segment file for segment {segment_index}: {e}")
+                self.client.current_audio_segment_wf = None
+
+    async def close_current_audio_segment(self, segment_index: int):
+        """Close the current audio segment WAV file."""
+        async with self.segment_lock:
+            try:
+                if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
+                    self.client.current_audio_segment_wf.close()
+                    self.logger.info(f"Closed audio segment file for segment {segment_index}.")
+                    self.client.current_audio_segment_wf = None
+            except Exception as e:
+                self.logger.error(f"Failed to close audio segment file for segment {segment_index}: {e}")
+
+    async def run(self):
+        """
+        Placeholder for any additional run logic if needed.
+        Currently, playback is handled by playback_task.
+        """
+        pass
