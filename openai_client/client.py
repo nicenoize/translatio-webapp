@@ -116,6 +116,7 @@ class OpenAIClient:
         self.websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
         self.websocket_clients_lock = asyncio.Lock()
 
+    async def enqueue_muxing_job(self, muxing_job: Dict[str, Any]):
         """
         Enqueue a muxing job to the Muxer.
         
