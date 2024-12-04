@@ -52,20 +52,33 @@ class VideoProcessor:
                 self.client.video_start_time = self.segment_start_time
 
             while self.client.running:
+                # Retrieve current segment_index safely
+                loop = self.client.loop
+                try:
+                    current_segment_index_future = asyncio.run_coroutine_threadsafe(
+                        self.client.get_segment_index(),
+                        loop
+                    )
+                    current_segment_index = current_segment_index_future.result()
+                except Exception as e:
+                    self.logger.error(f"Error retrieving segment_index: {e}")
+                    self.client.running = False
+                    break
+
                 # Define video writer for each segment
-                segment_output_path = f'output/video/output_video_segment_{self.client.segment_index}.mp4'
+                segment_output_path = f'output/video/output_video_segment_{current_segment_index}.mp4'
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Alternative codec
 
                 out = cv2.VideoWriter(segment_output_path, fourcc, fps, (width, height))
                 if not out.isOpened():
-                    self.logger.error(f"Failed to open VideoWriter for segment {self.client.segment_index}.")
+                    self.logger.error(f"Failed to open VideoWriter for segment {current_segment_index}.")
                     self.client.running = False
                     break
 
-                self.logger.info(f"Started recording segment {self.client.segment_index} to {segment_output_path}")
+                self.logger.info(f"Started recording segment {current_segment_index} to {segment_output_path}")
 
                 # Initialize the corresponding audio segment file
-                audio_segment_path = f'output/audio/output_audio_segment_{self.client.segment_index}.wav'
+                audio_segment_path = f'output/audio/output_audio_segment_{current_segment_index}.wav'
                 try:
                     os.makedirs(os.path.dirname(audio_segment_path), exist_ok=True)
                     wf = wave.open(audio_segment_path, 'wb')
@@ -78,7 +91,7 @@ class VideoProcessor:
                     self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
                     # Close VideoWriter if audio segment fails
                     out.release()
-                    self.logger.info(f"Released VideoWriter for segment {self.client.segment_index} due to audio init failure.")
+                    self.logger.info(f"Released VideoWriter for segment {current_segment_index} due to audio init failure.")
                     self.client.current_audio_segment_wf = None
                     continue
 
@@ -92,11 +105,11 @@ class VideoProcessor:
                     frame_count += 1
                     frames_written += 1
                     if frames_written % int(fps) == 0:
-                        self.logger.debug(f"Written {frames_written} frames to segment {self.client.segment_index}.")
+                        self.logger.debug(f"Written {frames_written} frames to segment {current_segment_index}.")
 
                 # Release the video writer
                 out.release()
-                self.logger.info(f"Segment {self.client.segment_index} saved to {segment_output_path}. Frames written: {frames_written}")
+                self.logger.info(f"Segment {current_segment_index} saved to {segment_output_path}. Frames written: {frames_written}")
 
                 # Introduce a small delay to ensure file system has completed writing
                 time.sleep(2)  # 2 seconds
@@ -119,12 +132,12 @@ class VideoProcessor:
                     self.logger.error(f"Failed to close audio segment file {audio_segment_path}: {e}")
 
                 # Enqueue muxing job
-                final_output_path = f'output/final/output_final_segment_{self.client.segment_index}.mp4'
+                final_output_path = f'output/final/output_final_segment_{current_segment_index}.mp4'
                 muxing_job = {
-                    "segment_index": self.client.segment_index,
+                    "segment_index": current_segment_index,
                     "video": segment_output_path,
                     "audio": audio_segment_path,
-                    "subtitles": self.client.SUBTITLE_PATH,
+                    "subtitles": f'output/subtitles/subtitles_segment_{current_segment_index}.vtt',
                     "output": final_output_path
                 }
                 # Enqueue muxing job in a thread-safe manner
@@ -134,7 +147,6 @@ class VideoProcessor:
                 )
 
                 # Reset for next segment
-                self.client.segment_index += 1
                 frame_count = 0
                 self.segment_start_time = time.perf_counter()
 

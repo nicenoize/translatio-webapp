@@ -73,14 +73,18 @@ class OpenAIClient:
         self.video_start_time = None
 
         # Subtitle Management
-        self.segment_index = 1  # Changed from subtitle_index
+        self.segment_index = 1
+        self.segment_index_lock = asyncio.Lock()  # Add a lock for segment_index
 
         # Initialize output WAV file
         self.output_wav = None
         self.init_output_wav()
 
         # Initialize WebVTT file
-        asyncio.create_task(self.initialize_vtt_file())
+        # Removed initializing main SUBTITLE_PATH as we're using segmented subtitles
+        # Initialize subtitles for the first segment
+        self.logger.info(f"Segment index: {self.segment_index}")
+        asyncio.create_task(self.initialize_temp_subtitles(self.segment_index))
 
         # Initialize metrics
         self.metrics = {
@@ -116,6 +120,35 @@ class OpenAIClient:
         self.websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
         self.websocket_clients_lock = asyncio.Lock()
 
+        # Ensure all necessary directories exist
+        os.makedirs('output/audio/responses', exist_ok=True)
+        os.makedirs('output/audio/output', exist_ok=True)
+        os.makedirs('output/subtitles', exist_ok=True)
+        os.makedirs('output/final', exist_ok=True)
+        os.makedirs('output/logs', exist_ok=True)
+
+    async def get_segment_index(self) -> int:
+        """Safely get the current segment index."""
+        async with self.segment_index_lock:
+            return self.segment_index
+
+    async def increment_segment_index(self):
+        """Safely increment the segment index."""
+        async with self.segment_index_lock:
+            self.segment_index += 1
+            self.logger.info(f"Incremented segment_index to {self.segment_index}")
+
+    async def initialize_temp_subtitles(self, segment_index: int):
+        """Initialize a temporary WebVTT subtitle file for the given segment."""
+        temp_subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.vtt'
+        try:
+            os.makedirs(os.path.dirname(temp_subtitles_path), exist_ok=True)
+            async with aiofiles.open(temp_subtitles_path, 'w', encoding='utf-8') as f:
+                await f.write("WEBVTT\n\n")
+            self.logger.info(f"Initialized temporary WebVTT file for segment {segment_index} at {temp_subtitles_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize temporary WebVTT file for segment {segment_index}: {e}")
+
     async def enqueue_muxing_job(self, muxing_job: Dict[str, Any]):
         """
         Enqueue a muxing job to the Muxer.
@@ -132,7 +165,7 @@ class OpenAIClient:
     def init_output_wav(self):
         """Initialize the output WAV file."""
         try:
-            os.makedirs('output/audio/output', exist_ok=True)
+            os.makedirs(os.path.dirname(self.OUTPUT_WAV_PATH), exist_ok=True)
             self.output_wav = wave.open(self.OUTPUT_WAV_PATH, 'wb')
             self.output_wav.setnchannels(self.AUDIO_CHANNELS)
             self.output_wav.setsampwidth(self.AUDIO_SAMPLE_WIDTH)
@@ -141,15 +174,6 @@ class OpenAIClient:
         except Exception as e:
             self.logger.error(f"Failed to initialize output WAV file: {e}")
             self.output_wav = None
-
-    async def initialize_vtt_file(self):
-        """Initialize the WebVTT file by writing the header."""
-        try:
-            async with aiofiles.open(self.SUBTITLE_PATH, 'w', encoding='utf-8') as f:
-                await f.write("WEBVTT\n\n")
-            self.logger.info(f"WebVTT file initialized at {self.SUBTITLE_PATH}")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize WebVTT file: {e}")
 
     def setup_delay_benchmarking(self):
         """Setup CSV for delay benchmarking."""
@@ -388,8 +412,32 @@ class OpenAIClient:
                 self.processing_delays.append(processing_delay)
                 await self.log_delay_metrics()
 
+                # Write subtitle to temporary WebVTT file
                 await self.write_vtt_subtitle(self.segment_index, start_time, end_time, transcript)
-                self.segment_index += 1  # Increment segment_index after writing subtitle
+
+                # Enqueue muxing job
+                muxing_job = {
+                    "segment_index": self.segment_index,
+                    "video": f'output/video/output_video_segment_{self.segment_index}.mp4',
+                    "audio": f'output/audio/output_audio_segment_{self.segment_index}.wav',
+                    "subtitles": f'output/subtitles/subtitles_segment_{self.segment_index}.vtt',
+                    "output": f'output/final/output_final_segment_{self.segment_index}.mp4'
+                }
+                await self.enqueue_muxing_job(muxing_job)
+                self.logger.info(f"Enqueued muxing job for segment {self.segment_index}")
+
+                # Close the current audio segment
+                await self.audio_processor.close_current_audio_segment(self.segment_index)
+
+                # Increment segment_index for the next segment
+                await self.increment_segment_index()
+
+                # Initialize subtitle file for the next segment
+                await self.initialize_temp_subtitles(self.segment_index)
+
+                # Start a new audio segment for the next video segment
+                await self.audio_processor.start_new_audio_segment(self.segment_index)
+
             else:
                 self.logger.warning("No sent audio timestamp available for transcript.")
                 # Optionally, assign default timings or skip
@@ -491,20 +539,16 @@ class OpenAIClient:
             # Path to the latest audio segment for gender detection
             latest_audio_segment = f'output/audio/output_audio_segment_{self.segment_index - 1}.wav'
 
+            # Detect gender
+            gender = self.predict_gender(latest_audio_segment)
+            if gender == 'male':
+                selected_voice = self.MALE_VOICE_ID
+            elif gender == 'female':
+                selected_voice = self.FEMALE_VOICE_ID
+            else:
+                selected_voice = self.DEFAULT_VOICE_ID  # Fallback to default voice
 
-            # Disable for error fixing
-            # # Detect gender
-            # gender = self.predict_gender(latest_audio_segment)
-            # if gender == 'male':
-            #     selected_voice = self.MALE_VOICE_ID  # Replace with actual voice identifier for male
-            # elif gender == 'female':
-            #     selected_voice = self.FEMALE_VOICE_ID  # Replace with actual voice identifier for female
-            # else:
-            #     selected_voice = self.DEFAULT_VOICE_ID  # Default voice
-
-            selected_voice = self.MALE_VOICE_ID
-
-            # self.logger.info(f"Detected gender: {gender}. Selected voice: {selected_voice}")
+            self.logger.info(f"Detected gender: {gender}. Selected voice: {selected_voice}")
 
             response_event = {
                 "type": "response.create",
@@ -583,8 +627,15 @@ class OpenAIClient:
 
     async def write_vtt_subtitle(self, index: int, start_time: float, end_time: float, text: str):
         """
-        Write a single subtitle entry to the WebVTT file.
+        Write a single subtitle entry to the temporary WebVTT file for the given segment.
+        
+        Args:
+            index (int): The index of the current subtitle within the segment.
+            start_time (float): Start time of the subtitle in seconds.
+            end_time (float): End time of the subtitle in seconds.
+            text (str): Subtitle text.
         """
+        temp_subtitles_path = f'output/subtitles/subtitles_segment_{self.segment_index}.vtt'
         try:
             # Convert seconds to WebVTT timestamp format HH:MM:SS.mmm.
             start_vtt = format_timestamp_vtt(start_time)
@@ -593,12 +644,12 @@ class OpenAIClient:
             # Prepare subtitle entry.
             subtitle = f"{index}\n{start_vtt} --> {end_vtt}\n{text}\n\n"
 
-            # Append to the WebVTT file.
-            async with aiofiles.open(self.SUBTITLE_PATH, 'a', encoding='utf-8') as f:
+            # Append to the temporary WebVTT file.
+            async with aiofiles.open(temp_subtitles_path, 'a', encoding='utf-8') as f:
                 await f.write(subtitle)
-            self.logger.debug(f"Written subtitle {index} to WebVTT.")
+            self.logger.debug(f"Written subtitle {index} to {temp_subtitles_path}.")
         except Exception as e:
-            self.logger.error(f"Error writing WebVTT subtitle {index}: {e}")
+            self.logger.error(f"Error writing WebVTT subtitle {index} to {temp_subtitles_path}: {e}")
 
     async def run_dashboard_server(self):
         """Run the real-time monitoring dashboard using aiohttp."""
