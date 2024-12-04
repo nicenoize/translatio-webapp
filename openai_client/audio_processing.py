@@ -76,13 +76,37 @@ class AudioProcessor:
                 self.logger.error(f"Error in audio_playback_handler: {e}")
 
     async def play_audio(self, audio_data: bytes):
-        """Play audio using simpleaudio and write to both output WAV and current audio segment WAV."""
+        """Play audio and manage segment-sized output files."""
         try:
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
             play_obj = sa.play_buffer(audio_array, AUDIO_CHANNELS, AUDIO_SAMPLE_WIDTH, AUDIO_SAMPLE_RATE)
             await asyncio.to_thread(play_obj.wait_done)
             self.logger.debug("Played translated audio chunk.")
 
+            # Buffer and manage segment sizes
+            async with self.segment_lock:
+                if not hasattr(self.client, 'segment_audio_buffer'):
+                    self.client.segment_audio_buffer = bytearray()
+                
+                # Append audio data to the buffer
+                self.client.segment_audio_buffer.extend(audio_data)
+
+                # Determine required bytes for a segment
+                bytes_per_second = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH
+                segment_size_bytes = int(AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH * SEGMENT_DURATION)
+                
+                # Write full segments to files
+                while len(self.client.segment_audio_buffer) >= segment_size_bytes:
+                    segment_data = self.client.segment_audio_buffer[:segment_size_bytes]
+                    self.client.segment_audio_buffer = self.client.segment_audio_buffer[segment_size_bytes:]
+
+                    # Write to current segment WAV file
+                    if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
+                        self.client.current_audio_segment_wf.writeframes(segment_data)
+                        self.logger.debug(f"Written segment of size {segment_size_bytes} bytes to current segment WAV file.")
+                    else:
+                        self.logger.warning("No current audio segment WAV file to write to.")
+            
             # Write to output WAV
             if self.client.output_wav:
                 self.client.output_wav.writeframes(audio_data)
@@ -90,16 +114,9 @@ class AudioProcessor:
             else:
                 self.logger.warning("Output WAV file is not initialized.")
 
-            # Write to current audio segment WAV
-            async with self.segment_lock:
-                if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
-                    self.client.current_audio_segment_wf.writeframes(audio_data)
-                    self.logger.debug("Written translated audio chunk to current audio segment WAV file.")
-                else:
-                    self.logger.warning("No current audio segment WAV file to write to.")
-
         except Exception as e:
-            self.logger.error(f"Error playing audio: {e}")
+            self.logger.error(f"Error playing or buffering audio: {e}")
+
 
     async def start_new_audio_segment(self, segment_index: int):
         """Initialize a new audio segment WAV file for the given segment index."""

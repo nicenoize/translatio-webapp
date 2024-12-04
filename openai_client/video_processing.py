@@ -44,7 +44,7 @@ class VideoProcessor:
             self.logger.info(f"Video properties - FPS: {fps}, Width: {width}, Height: {height}")
 
             # Initialize variables for video segmentation
-            segment_frames = int(fps * self.segment_duration)
+            segment_frames = round(fps * self.segment_duration)
             frame_count = 0
             self.segment_start_time = time.perf_counter()
 

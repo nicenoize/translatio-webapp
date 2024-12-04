@@ -247,7 +247,8 @@ class OpenAIClient:
         except Exception as e:
             self.logger.error(f"Failed to connect to Realtime API: {e}")
             raise
-
+    
+    # Without VAD
     async def initialize_session(self):
         """Initialize session with desired configurations."""
         session_update_event = {
@@ -256,6 +257,8 @@ class OpenAIClient:
                 "instructions": (
                     "You are a real-time translator. Translate the audio you receive into German without performing Voice Activity Detection (VAD). "
                     "Ensure that the translated audio matches the input audio's duration and timing exactly to facilitate synchronization with video. "
+                    "If there is silence, or no one speaking, please fill this space with silence in order to keep the same output length as input length. "
+                    "If there are multiple people speaking, please try to use different voices for each of them. "
                     "Provide detailed and comprehensive translations without truncating sentences. "
                     "Do not respond conversationally."
                 ),
@@ -269,6 +272,35 @@ class OpenAIClient:
         }
         await self.enqueue_message(session_update_event)
         self.logger.info("Session update event enqueued.")
+
+    # # With VAD
+    # async def initialize_session(self):
+    #     """Initialize session with desired configurations."""
+    #     session_update_event = {
+    #         "type": "session.update",
+    #         "session": {
+    #             "instructions": (
+    #                 "You are a real-time translator. Translate the audio you receive into German without performing Voice Activity Detection (VAD). "
+    #                 "Ensure that the translated audio matches the input audio's duration and timing exactly to facilitate synchronization with video. "
+    #                 "Provide detailed and comprehensive translations without truncating sentences. "
+    #                 "Do not respond conversationally."
+    #             ),
+    #             "modalities": ["text", "audio"],
+    #             "voice": self.DEFAULT_VOICE_ID,
+    #             "input_audio_format": "pcm16",
+    #             "output_audio_format": "pcm16",
+    #             "temperature": 0.8,
+    #             "turn_detection": {
+    #                 "type": "server_vad",
+    #                 "threshold": 0.5,
+    #                 "prefix_padding_ms": 300,
+    #                 "silence_duration_ms": 500
+    #             },
+    #             "tools": []  # Add tool definitions here if needed
+    #         }
+    #     }
+    #     await self.enqueue_message(session_update_event)
+    #     self.logger.info("Session update event enqueued.")
 
     async def enqueue_message(self, message: dict):
         """Enqueue a message to be sent over WebSocket."""
@@ -596,9 +628,14 @@ class OpenAIClient:
             return None
 
     async def read_input_audio(self):
-        """Read audio from a named pipe and send to Realtime API."""
+        """Read audio from a named pipe and send to Realtime API in chunks of SEGMENT_DURATION."""
         self.create_named_pipe(self.INPUT_AUDIO_PIPE)
         self.logger.info("Starting to read from input_audio_pipe.")
+        
+        # Buffer to collect audio until it matches SEGMENT_DURATION
+        audio_buffer = bytearray()
+        bytes_per_second = self.AUDIO_SAMPLE_RATE * self.AUDIO_CHANNELS * self.AUDIO_SAMPLE_WIDTH
+
         while self.running:
             try:
                 async with aiofiles.open(self.INPUT_AUDIO_PIPE, 'rb') as pipe:
@@ -607,11 +644,24 @@ class OpenAIClient:
                         if not data:
                             await asyncio.sleep(0.05)
                             continue
-                        await self.audio_processor.send_input_audio(data)
-                        self.logger.info(f"Enqueued audio chunk of size: {len(data)} bytes.")
+
+                        audio_buffer.extend(data)
+
+                        # Check if buffer exceeds SEGMENT_DURATION
+                        required_size = int(bytes_per_second * self.SEGMENT_DURATION)
+                        if len(audio_buffer) >= required_size:
+                            # Slice out the required segment
+                            segment = audio_buffer[:required_size]
+                            audio_buffer = audio_buffer[required_size:]
+
+                            # Enqueue the segment for processing
+                            await self.audio_processor.send_input_audio(segment)
+                            self.logger.info(f"Sent audio segment of size: {len(segment)} bytes.")
+
             except Exception as e:
                 self.logger.error(f"Error reading input audio: {e}")
                 await asyncio.sleep(1)  # Prevent tight loop on error
+
 
     def create_named_pipe(self, pipe_name: str):
         """Create a named pipe if it doesn't exist."""
