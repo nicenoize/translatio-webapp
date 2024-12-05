@@ -16,7 +16,7 @@ class RTMPStreamer:
         logger: logging.Logger,
         final_video_dir: str = 'output/final',
         subtitles_path: str = 'output/subtitles/subtitles.vtt',
-        rtmp_url: str = 'rtmp://sNVi5-egEGF.bintu-vtrans.nanocosmos.de/live',
+        rtmp_url: str = 'rtmp://bintu-vtrans.nanocosmos.de/live/sNVi5-egEGF',
     ):
         """
         Initialize the RTMPStreamer.

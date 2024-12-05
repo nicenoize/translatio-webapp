@@ -23,7 +23,7 @@ DASHBOARD_PORT = 8080
 # Voice Identifiers
 MALE_VOICE_ID = "shimmer"
 FEMALE_VOICE_ID = "coral"
-DEFAULT_VOICE_ID = "alloy"
+DEFAULT_VOICE_ID = "coral"
 
 # Other Configurations
 SEGMENT_DURATION = 5  # seconds

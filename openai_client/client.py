@@ -274,7 +274,7 @@ class OpenAIClient:
                 "voice": self.DEFAULT_VOICE_ID,
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "temperature": 0.8,
+                "temperature": 1.08,
                 "tools": []  # Add tool definitions here if needed
             }
         }
