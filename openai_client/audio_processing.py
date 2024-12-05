@@ -98,9 +98,6 @@ class AudioProcessor:
         except Exception as e:
             self.logger.error(f"Error playing or buffering audio: {e}")
 
-
-
-
     async def start_new_audio_segment(self, segment_index: int = None):
         """Initialize a new audio segment WAV file for the given segment index."""
         async with self.segment_lock:
@@ -119,7 +116,6 @@ class AudioProcessor:
                 self.logger.error(f"Failed to initialize audio segment file for segment {segment_index}: {e}")
                 self.client.current_audio_segment_wf = None
 
-
     async def close_current_audio_segment(self, segment_index: int = None):
         """Close the current audio segment WAV file."""
         async with self.segment_lock:
@@ -132,11 +128,3 @@ class AudioProcessor:
                     self.client.current_audio_segment_wf = None
             except Exception as e:
                 self.logger.error(f"Failed to close audio segment file for segment {segment_index}: {e}")
-
-
-    async def run(self):
-        """
-        Placeholder for any additional run logic if needed.
-        Currently, playback is handled by playback_task.
-        """
-        pass

@@ -1,3 +1,5 @@
+# openai_client/video_processing.py
+
 import asyncio
 import cv2
 import time
@@ -31,7 +33,7 @@ class VideoProcessor:
 
             # Get video properties
             fps = cap.get(cv2.CAP_PROP_FPS)
-            if fps == 0 or fps is None:
+            if fps == 0 or fps is None or fps != fps:  # Check for NaN
                 fps = 30.0  # Default FPS if unable to get from stream
                 self.logger.warning(f"Unable to get FPS from stream. Defaulting to {fps} FPS.")
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
@@ -43,10 +45,11 @@ class VideoProcessor:
                 # Initialize frame count for this segment
                 frame_count = 0
                 frames_written = 0
-                self.segment_start_time = time.perf_counter()
+                segment_start_time = time.perf_counter()
 
                 if self.client.video_start_time is None:
-                    self.client.video_start_time = self.segment_start_time
+                    self.client.video_start_time = segment_start_time
+                    self.logger.debug(f"Set video_start_time to {self.client.video_start_time}")
 
                 # Retrieve current segment_index safely
                 try:
@@ -74,6 +77,7 @@ class VideoProcessor:
 
                 # Calculate the number of frames per segment
                 segment_frames = round(fps * self.segment_duration)
+                self.logger.debug(f"Segment frames to capture: {segment_frames}")
 
                 # Record frames for the current segment
                 while frame_count < segment_frames and self.client.running:

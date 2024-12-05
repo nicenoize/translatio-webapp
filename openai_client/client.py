@@ -143,16 +143,22 @@ class OpenAIClient:
             assert self.segment_index > old_index, "Segment index did not increment correctly!"
 
 
+
     async def initialize_temp_subtitles(self, segment_index: int):
         """Initialize a temporary WebVTT subtitle file for the given segment."""
         temp_subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.vtt'
         try:
             os.makedirs(os.path.dirname(temp_subtitles_path), exist_ok=True)
-            async with aiofiles.open(temp_subtitles_path, 'w', encoding='utf-8') as f:
-                await f.write("WEBVTT\n\n")
-            self.logger.info(f"Initialized temporary WebVTT file for segment {segment_index} at {temp_subtitles_path}")
+            # Check if the file already exists to prevent overwriting
+            if not os.path.exists(temp_subtitles_path):
+                async with aiofiles.open(temp_subtitles_path, 'w', encoding='utf-8') as f:
+                    await f.write("WEBVTT\n\n")
+                self.logger.info(f"Initialized temporary WebVTT file for segment {segment_index} at {temp_subtitles_path}")
+            else:
+                self.logger.info(f"Temporary WebVTT file for segment {segment_index} already exists at {temp_subtitles_path}")
         except Exception as e:
             self.logger.error(f"Failed to initialize temporary WebVTT file for segment {segment_index}: {e}")
+
 
     async def enqueue_muxing_job(self, muxing_job: Dict[str, Any]):
         """
@@ -399,6 +405,7 @@ class OpenAIClient:
                 self.logger.error(f"Unexpected error in handle_responses: {e}")
                 await self.reconnect()
 
+    # openai_client/client.py
 
     async def process_event(self, event: dict):
         """Process a single event from the WebSocket."""
@@ -409,14 +416,12 @@ class OpenAIClient:
             self.logger.info("Speech started detected by server.")
             # No action needed as server handles VAD
 
-
         elif event_type == "response.text.delta":
             delta_text = event.get("delta", "")
             self.logger.info(f"Received text delta: '{delta_text}'")
             self.logger.debug(f"Current transcript before update: '{self.current_transcript}'")
             self.current_transcript += delta_text
             self.logger.debug(f"Updated transcript: '{self.current_transcript}'")
-
 
         elif event_type == "input_audio_buffer.speech_stopped":
             self.logger.info("Speech stopped detected by server.")
@@ -441,25 +446,30 @@ class OpenAIClient:
                 self.logger.debug("Received empty audio delta.")
 
         elif event_type == "response.audio_transcript.done":
+            transcript = event.get("transcript", "").strip()
+            if not transcript:
+                self.logger.warning("Received empty transcript in 'response.audio_transcript.done' event.")
+                return
+
             if self.sent_audio_timestamps:
                 sent_time = self.sent_audio_timestamps.popleft()
                 current_time = self.loop.time()
                 processing_delay = current_time - sent_time
-                # Calculate audio duration based on chunk size
-                audio_data = event.get("audio", "")
-                audio_chunk_size = len(base64.b64decode(audio_data)) if audio_data else 0
-                audio_duration = audio_chunk_size / (self.AUDIO_SAMPLE_RATE * self.AUDIO_CHANNELS * self.AUDIO_SAMPLE_WIDTH) if audio_chunk_size else 0.0
+                self.logger.debug(f"Processing delay calculated: {processing_delay:.6f}s")
+
+                # Assume audio_duration based on SEGMENT_DURATION since 'audio' field is missing
+                audio_duration = self.SEGMENT_DURATION
+                self.logger.debug(f"Assumed audio duration: {audio_duration:.3f}s")
+
                 # Calculate start and end times relative to video_start_time
                 if self.video_start_time:
                     start_time = sent_time - self.video_start_time
                     end_time = start_time + audio_duration + processing_delay
                 else:
-                    # If video_start_time is not set, default to 0
+                    # If video_start_time is not set, default to current_time
                     start_time = 0.0
                     end_time = audio_duration + processing_delay
 
-                # Use the accumulated transcript
-                transcript = self.current_transcript.strip()
                 self.logger.info(f"Received transcript: '{transcript}'")
                 self.logger.info(f"Subtitle timing - Start: {start_time:.3f}s, End: {end_time:.3f}s")
 
@@ -474,12 +484,11 @@ class OpenAIClient:
                 await self.write_vtt_subtitle(current_segment_index, start_time, end_time, transcript)
                 self.logger.debug(f"Subtitle written for segment {current_segment_index}: '{transcript}'")
 
-                processing_delay = self.processing_delays[-1]  # Use the last processing delay
                 buffer = 0.5  # Add a small buffer for seamless video/audio sync
                 audio_offset = processing_delay + buffer
 
                 # Close the current audio segment
-                await self.audio_processor.close_current_audio_segment(current_segment_index - 1)
+                await self.audio_processor.close_current_audio_segment(video_segment_index)
 
                 # Enqueue muxing job
                 muxing_job = {
@@ -495,43 +504,62 @@ class OpenAIClient:
 
                 # Initialize subtitle file for the next segment
                 await self.initialize_temp_subtitles(current_segment_index)
+                self.logger.debug(f"Initialized subtitle file for next segment: {current_segment_index}")
 
                 # Start a new audio segment for the next video segment
                 await self.audio_processor.start_new_audio_segment(current_segment_index)
+                self.logger.debug(f"Started new audio segment for segment index: {current_segment_index}")
 
                 # Reset the current transcript for the next segment
                 self.current_transcript = ""
                 self.logger.debug("Reset current transcript for the next segment.")
 
+            elif event_type == "response.content_part.done":
+                content_part = event.get("content_part", "")
+                # Handle content part if necessary
+                self.logger.info(f"Received content part: '{content_part}'")
+                # Depending on content, may need to process further
+
+            elif event_type == "response.output_item.done":
+                output_item = event.get("output_item", "")
+                # Handle output item if necessary
+                self.logger.info(f"Received output item: '{output_item}'")
+                # Depending on content, may need to process further
+
+            elif event_type == "response.created":
+                self.logger.info("Response created event received.")
+                # Handle response creation if necessary
+
+            elif event_type == "response.audio_transcript.delta":
+                delta_text = event.get("delta", "")
+                if delta_text:
+                    self.logger.info(f"Received transcript delta: '{delta_text}'")
+                    self.current_transcript += delta_text
+                    self.logger.debug(f"Updated transcript with delta: '{self.current_transcript}'")
+                else:
+                    self.logger.debug("Received empty transcript delta.")
+
+            elif event_type == "rate_limits.updated":
+                rate_limits = event.get("rate_limits", [])
+                self.logger.info(f"Rate limits updated: {rate_limits}")
+                # Handle rate limit updates if necessary
+
+            elif event_type == "response.output_item.added":
+                self.logger.info("Output item added event received.")
+                # Handle added output items if necessary
+
+            elif event_type == "response.content_part.added":
+                self.logger.info("Content part added event received.")
+                # Handle added content parts if necessary
+
+            elif event_type == "input_audio_buffer.committed":
+                self.logger.info("Audio buffer committed.")
+                # Handle audio buffer commit if necessary
+
             else:
-                self.logger.warning("No sent audio timestamp available for transcript.")
-                # Optionally, assign default timings or skip
+                self.logger.warning(f"Unhandled event type: {event_type}")
 
-
-        elif event_type == "response.content_part.done":
-            content_part = event.get("content_part", "")
-            # Handle content part if necessary
-            self.logger.info(f"Received content part: '{content_part}'")
-            # Depending on content, may need to process further
-
-        elif event_type == "response.output_item.done":
-            output_item = event.get("output_item", "")
-            # Handle output item if necessary
-            self.logger.info(f"Received output item: '{output_item}'")
-            # Depending on content, may need to process further
-
-        elif event_type == "response.done":
-            self.logger.info("Response processing completed.")
-            # Release the response lock to allow new responses
-            if self.response_lock.locked():
-                self.response_lock.release()
-
-        elif event_type == "error":
-            error = event.get("error", {})
-            self.logger.error(f"Error received: {error.get('message')}, Code: {error.get('code')}")
-
-        else:
-            self.logger.warning(f"Unhandled event type: {event_type}")
+            self.logger.debug("Event processed.")
 
 
     async def handle_function_call(self, item: dict):
@@ -654,16 +682,21 @@ class OpenAIClient:
                 return None
             avg_pitch = np.mean(pitches)
             self.logger.debug(f"Average pitch for gender prediction: {avg_pitch:.2f} Hz")
-            # Simple heuristic: Female voices typically have higher pitch (>165 Hz)
-            if avg_pitch > 165:
+            # Updated heuristic: Female voices typically have higher pitch (>165 Hz)
+            # Adjusted to account for realistic pitch ranges
+            if 165 <= avg_pitch <= 255:
                 self.logger.info(f"Predicted gender: female (avg_pitch={avg_pitch:.2f} Hz)")
                 return 'female'
-            else:
+            elif 85 <= avg_pitch < 165:
                 self.logger.info(f"Predicted gender: male (avg_pitch={avg_pitch:.2f} Hz)")
                 return 'male'
+            else:
+                self.logger.warning(f"Unusual pitch detected: {avg_pitch:.2f} Hz. Unable to determine gender.")
+                return None
         except Exception as e:
             self.logger.error(f"Error predicting gender: {e}")
             return None
+
 
 
     async def read_input_audio(self):
@@ -704,6 +737,12 @@ class OpenAIClient:
     async def write_vtt_subtitle(self, segment_index: int, start_time: float, end_time: float, text: str):
         temp_subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.vtt'
         try:
+            # Check if it's the first subtitle being written
+            if not os.path.exists(temp_subtitles_path):
+                async with aiofiles.open(temp_subtitles_path, 'w', encoding='utf-8') as f:
+                    await f.write("WEBVTT\n\n")
+                self.logger.debug(f"Initialized WebVTT header for {temp_subtitles_path}")
+
             # Convert seconds to WebVTT timestamp format HH:MM:SS.mmm.
             start_vtt = format_timestamp_vtt(start_time)
             end_vtt = format_timestamp_vtt(end_time)
@@ -718,7 +757,6 @@ class OpenAIClient:
             self.logger.debug(f"Written subtitle {subtitle_index} to {temp_subtitles_path}: '{subtitle.strip()}'")
         except Exception as e:
             self.logger.error(f"Error writing WebVTT subtitle to {temp_subtitles_path}: {e}")
-
 
 
     async def get_next_subtitle_index(self, segment_index: int) -> int:
