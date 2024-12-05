@@ -385,7 +385,7 @@ class OpenAIClient:
             try:
                 response = await self.ws.recv()
                 event = json.loads(response)
-                self.logger.debug(f"Received event: {event}")  # Log entire event for debugging
+                self.logger.debug(f"Received event: {json.dumps(event, indent=2)}")  # Log entire event for debugging
                 await self.process_event(event)
             except websockets.exceptions.ConnectionClosedOK:
                 self.logger.warning("WebSocket connection closed normally.")
@@ -399,6 +399,7 @@ class OpenAIClient:
                 self.logger.error(f"Unexpected error in handle_responses: {e}")
                 await self.reconnect()
 
+
     async def process_event(self, event: dict):
         """Process a single event from the WebSocket."""
         event_type = event.get("type")
@@ -411,8 +412,10 @@ class OpenAIClient:
 
         elif event_type == "response.text.delta":
             delta_text = event.get("delta", "")
-            self.logger.info(f"Received text delta: {delta_text}")
+            self.logger.info(f"Received text delta: '{delta_text}'")
+            self.logger.debug(f"Current transcript before update: '{self.current_transcript}'")
             self.current_transcript += delta_text
+            self.logger.debug(f"Updated transcript: '{self.current_transcript}'")
 
 
         elif event_type == "input_audio_buffer.speech_stopped":
@@ -433,6 +436,7 @@ class OpenAIClient:
             audio_data = event.get("delta", "")
             if audio_data:
                 await self.audio_processor.handle_audio_delta(audio_data)
+                self.logger.debug(f"Processed audio delta of size: {len(audio_data)}")
             else:
                 self.logger.debug("Received empty audio delta.")
 
@@ -456,8 +460,8 @@ class OpenAIClient:
 
                 # Use the accumulated transcript
                 transcript = self.current_transcript.strip()
-                self.logger.info(f"Received transcript: {transcript}")
-                self.logger.info(f"Subtitle timing - Start: {start_time}, End: {end_time}")
+                self.logger.info(f"Received transcript: '{transcript}'")
+                self.logger.info(f"Subtitle timing - Start: {start_time:.3f}s, End: {end_time:.3f}s")
 
                 # Append processing_delay
                 self.processing_delays.append(processing_delay)
@@ -468,6 +472,8 @@ class OpenAIClient:
 
                 # Write subtitle to temporary WebVTT file
                 await self.write_vtt_subtitle(current_segment_index, start_time, end_time, transcript)
+                self.logger.debug(f"Subtitle written for segment {current_segment_index}: '{transcript}'")
+
                 processing_delay = self.processing_delays[-1]  # Use the last processing delay
                 buffer = 0.5  # Add a small buffer for seamless video/audio sync
                 audio_offset = processing_delay + buffer
@@ -495,6 +501,7 @@ class OpenAIClient:
 
                 # Reset the current transcript for the next segment
                 self.current_transcript = ""
+                self.logger.debug("Reset current transcript for the next segment.")
 
             else:
                 self.logger.warning("No sent audio timestamp available for transcript.")
@@ -504,13 +511,13 @@ class OpenAIClient:
         elif event_type == "response.content_part.done":
             content_part = event.get("content_part", "")
             # Handle content part if necessary
-            self.logger.info(f"Received content part: {content_part}")
+            self.logger.info(f"Received content part: '{content_part}'")
             # Depending on content, may need to process further
 
         elif event_type == "response.output_item.done":
             output_item = event.get("output_item", "")
             # Handle output item if necessary
-            self.logger.info(f"Received output item: {output_item}")
+            self.logger.info(f"Received output item: '{output_item}'")
             # Depending on content, may need to process further
 
         elif event_type == "response.done":
@@ -525,6 +532,7 @@ class OpenAIClient:
 
         else:
             self.logger.warning(f"Unhandled event type: {event_type}")
+
 
     async def handle_function_call(self, item: dict):
         """
@@ -607,7 +615,7 @@ class OpenAIClient:
             else:
                 selected_voice = self.DEFAULT_VOICE_ID  # Fallback to default voice
 
-            self.logger.info(f"Detected gender: {gender}. Selected voice: {selected_voice}")
+            self.logger.info(f"Detected gender: '{gender}'. Selected voice ID: '{selected_voice}'")
 
             response_event = {
                 "type": "response.create",
@@ -623,6 +631,7 @@ class OpenAIClient:
                     "tools": []  # Add tool definitions here if needed
                 }
             }
+            self.logger.debug(f"Enqueuing response event with selected voice: {response_event}")
             await self.enqueue_message(response_event)
             self.logger.info("Created response event with dynamic voice selection.")
 
@@ -647,16 +656,18 @@ class OpenAIClient:
             self.logger.debug(f"Average pitch for gender prediction: {avg_pitch:.2f} Hz")
             # Simple heuristic: Female voices typically have higher pitch (>165 Hz)
             if avg_pitch > 165:
+                self.logger.info(f"Predicted gender: female (avg_pitch={avg_pitch:.2f} Hz)")
                 return 'female'
             else:
+                self.logger.info(f"Predicted gender: male (avg_pitch={avg_pitch:.2f} Hz)")
                 return 'male'
         except Exception as e:
             self.logger.error(f"Error predicting gender: {e}")
             return None
 
+
     async def read_input_audio(self):
         """Read audio from a named pipe and send to Realtime API in chunks of SEGMENT_DURATION."""
-        self.create_named_pipe(self.INPUT_AUDIO_PIPE)
         self.logger.info("Starting to read from input_audio_pipe.")
         
         # Buffer to collect audio until it matches SEGMENT_DURATION
@@ -690,18 +701,6 @@ class OpenAIClient:
                 await asyncio.sleep(1)  # Prevent tight loop on error
 
 
-    def create_named_pipe(self, pipe_name: str):
-        """Create a named pipe if it doesn't exist."""
-        try:
-            if not os.path.exists(pipe_name):
-                os.mkfifo(pipe_name)
-                self.logger.info(f"Created named pipe: {pipe_name}")
-            else:
-                self.logger.info(f"Named pipe already exists: {pipe_name}")
-        except Exception as e:
-            self.logger.error(f"Error creating named pipe {pipe_name}: {e}")
-            raise
-
     async def write_vtt_subtitle(self, segment_index: int, start_time: float, end_time: float, text: str):
         temp_subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.vtt'
         try:
@@ -716,9 +715,10 @@ class OpenAIClient:
             # Append to the temporary WebVTT file.
             async with aiofiles.open(temp_subtitles_path, 'a', encoding='utf-8') as f:
                 await f.write(subtitle)
-            self.logger.debug(f"Written subtitle {subtitle_index} to {temp_subtitles_path}.")
+            self.logger.debug(f"Written subtitle {subtitle_index} to {temp_subtitles_path}: '{subtitle.strip()}'")
         except Exception as e:
-            self.logger.error(f"Error writing WebVTT subtitle {subtitle_index} to {temp_subtitles_path}: {e}")
+            self.logger.error(f"Error writing WebVTT subtitle to {temp_subtitles_path}: {e}")
+
 
 
     async def get_next_subtitle_index(self, segment_index: int) -> int:
