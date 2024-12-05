@@ -76,49 +76,37 @@ class AudioProcessor:
                 self.logger.error(f"Error in audio_playback_handler: {e}")
 
     async def play_audio(self, audio_data: bytes):
-        """Play audio and manage segment-sized output files."""
         try:
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
             play_obj = sa.play_buffer(audio_array, AUDIO_CHANNELS, AUDIO_SAMPLE_WIDTH, AUDIO_SAMPLE_RATE)
             await asyncio.to_thread(play_obj.wait_done)
 
-            # Buffer and manage segment sizes
             async with self.segment_lock:
-                if not hasattr(self.client, 'segment_audio_buffer'):
-                    self.client.segment_audio_buffer = bytearray()
-                
-                # Append audio data to the buffer
-                self.client.segment_audio_buffer.extend(audio_data)
-
-                # Determine required bytes for a segment
-                segment_size_bytes = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH * SEGMENT_DURATION
-
-                # Write full segments to files
-                while len(self.client.segment_audio_buffer) >= segment_size_bytes:
-                    segment_data = self.client.segment_audio_buffer[:segment_size_bytes]
-                    self.client.segment_audio_buffer = self.client.segment_audio_buffer[segment_size_bytes:]
-
-                    if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
-                        self.client.current_audio_segment_wf.writeframes(segment_data)
-                        self.logger.debug(f"Written segment of size {segment_size_bytes} bytes to audio segment WAV file.")
-                    else:
-                        self.logger.warning("No current audio segment WAV file to write to.")
-                
-                # Write to output WAV
-                if self.client.output_wav:
-                    self.client.output_wav.writeframes(audio_data)
-                    self.logger.debug("Written translated audio chunk to output WAV file.")
+                if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
+                    self.client.current_audio_segment_wf.writeframes(audio_data)
+                    self.logger.debug("Written audio data to current audio segment WAV file.")
                 else:
-                    self.logger.warning("Output WAV file is not initialized.")
+                    self.logger.warning("No current audio segment WAV file to write to.")
+
+            # Write to output WAV
+            if self.client.output_wav:
+                self.client.output_wav.writeframes(audio_data)
+                self.logger.debug("Written translated audio chunk to output WAV file.")
+            else:
+                self.logger.warning("Output WAV file is not initialized.")
 
         except Exception as e:
             self.logger.error(f"Error playing or buffering audio: {e}")
 
 
-    async def start_new_audio_segment(self, segment_index: int):
+
+
+    async def start_new_audio_segment(self, segment_index: int = None):
         """Initialize a new audio segment WAV file for the given segment index."""
         async with self.segment_lock:
             try:
+                if segment_index is None:
+                    segment_index = await self.client.get_segment_index()
                 audio_segment_path = f'output/audio/output_audio_segment_{segment_index}.wav'
                 os.makedirs(os.path.dirname(audio_segment_path), exist_ok=True)
                 wf = wave.open(audio_segment_path, 'wb')
@@ -131,16 +119,20 @@ class AudioProcessor:
                 self.logger.error(f"Failed to initialize audio segment file for segment {segment_index}: {e}")
                 self.client.current_audio_segment_wf = None
 
-    async def close_current_audio_segment(self, segment_index: int):
+
+    async def close_current_audio_segment(self, segment_index: int = None):
         """Close the current audio segment WAV file."""
         async with self.segment_lock:
             try:
+                if segment_index is None:
+                    segment_index = await self.client.get_segment_index() - 1  # Adjust for the previous segment
                 if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
                     self.client.current_audio_segment_wf.close()
                     self.logger.info(f"Closed audio segment file for segment {segment_index}.")
                     self.client.current_audio_segment_wf = None
             except Exception as e:
                 self.logger.error(f"Failed to close audio segment file for segment {segment_index}: {e}")
+
 
     async def run(self):
         """

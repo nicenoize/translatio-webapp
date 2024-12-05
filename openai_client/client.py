@@ -72,6 +72,9 @@ class OpenAIClient:
         # Timestamps
         self.video_start_time = None
 
+        # Transcript
+        self.current_transcript = ""
+
         # Subtitle Management
         self.segment_index = 1
         self.segment_index_lock = asyncio.Lock()  # Add a lock for segment_index
@@ -405,6 +408,13 @@ class OpenAIClient:
             self.logger.info("Speech started detected by server.")
             # No action needed as server handles VAD
 
+
+        elif event_type == "response.text.delta":
+            delta_text = event.get("delta", "")
+            self.logger.info(f"Received text delta: {delta_text}")
+            self.current_transcript += delta_text
+
+
         elif event_type == "input_audio_buffer.speech_stopped":
             self.logger.info("Speech stopped detected by server.")
             await self.commit_audio_buffer()
@@ -420,7 +430,6 @@ class OpenAIClient:
                 await self.handle_function_call(item)
 
         elif event_type == "response.audio.delta":
-            self.logger.debug("Audio delta detected: %s", event)
             audio_data = event.get("delta", "")
             if audio_data:
                 await self.audio_processor.handle_audio_delta(audio_data)
@@ -428,7 +437,6 @@ class OpenAIClient:
                 self.logger.debug("Received empty audio delta.")
 
         elif event_type == "response.audio_transcript.done":
-            transcript = event.get("transcript", "")
             if self.sent_audio_timestamps:
                 sent_time = self.sent_audio_timestamps.popleft()
                 current_time = self.loop.time()
@@ -446,6 +454,8 @@ class OpenAIClient:
                     start_time = 0.0
                     end_time = audio_duration + processing_delay
 
+                # Use the accumulated transcript
+                transcript = self.current_transcript.strip()
                 self.logger.info(f"Received transcript: {transcript}")
                 self.logger.info(f"Subtitle timing - Start: {start_time}, End: {end_time}")
 
@@ -453,39 +463,43 @@ class OpenAIClient:
                 self.processing_delays.append(processing_delay)
                 await self.log_delay_metrics()
 
+                current_segment_index = await self.get_segment_index()
+                video_segment_index = current_segment_index - 1  # Video segment corresponds to previous index
+
                 # Write subtitle to temporary WebVTT file
-                await self.write_vtt_subtitle(self.segment_index, start_time, end_time, transcript)
+                await self.write_vtt_subtitle(current_segment_index, start_time, end_time, transcript)
                 processing_delay = self.processing_delays[-1]  # Use the last processing delay
                 buffer = 0.5  # Add a small buffer for seamless video/audio sync
                 audio_offset = processing_delay + buffer
 
+                # Close the current audio segment
+                await self.audio_processor.close_current_audio_segment(current_segment_index - 1)
+
                 # Enqueue muxing job
                 muxing_job = {
-                    "segment_index": self.segment_index,
-                    "video": f'output/video/output_video_segment_{self.segment_index}.mp4',
-                    "audio": f'output/audio/output_audio_segment_{self.segment_index}.wav',
-                    "subtitles": f'output/subtitles/subtitles_segment_{self.segment_index}.vtt',
-                    "output": f'output/final/output_final_segment_{self.segment_index}.mp4',
+                    "segment_index": video_segment_index,
+                    "video": f'output/video/output_video_segment_{video_segment_index}.mp4',
+                    "audio": f'output/audio/output_audio_segment_{video_segment_index}.wav',
+                    "subtitles": f'output/subtitles/subtitles_segment_{video_segment_index}.vtt',
+                    "output": f'output/final/output_final_segment_{video_segment_index}.mp4',
                     "audio_offset": audio_offset  # Default to 0 if no delay recorded
                 }
                 await self.enqueue_muxing_job(muxing_job)
-                self.logger.info(f"Enqueued muxing job for segment {self.segment_index}")
-
-                # Close the current audio segment
-                await self.audio_processor.close_current_audio_segment(self.segment_index)
-
-                # Increment segment_index for the next segment
-                # await self.increment_segment_index()
+                self.logger.info(f"Enqueued muxing job for segment {video_segment_index}")
 
                 # Initialize subtitle file for the next segment
-                await self.initialize_temp_subtitles(self.segment_index)
+                await self.initialize_temp_subtitles(current_segment_index)
 
                 # Start a new audio segment for the next video segment
-                await self.audio_processor.start_new_audio_segment(self.segment_index)
+                await self.audio_processor.start_new_audio_segment(current_segment_index)
+
+                # Reset the current transcript for the next segment
+                self.current_transcript = ""
 
             else:
                 self.logger.warning("No sent audio timestamp available for transcript.")
                 # Optionally, assign default timings or skip
+
 
         elif event_type == "response.content_part.done":
             content_part = event.get("content_part", "")
@@ -688,31 +702,33 @@ class OpenAIClient:
             self.logger.error(f"Error creating named pipe {pipe_name}: {e}")
             raise
 
-    async def write_vtt_subtitle(self, index: int, start_time: float, end_time: float, text: str):
-        """
-        Write a single subtitle entry to the temporary WebVTT file for the given segment.
-        
-        Args:
-            index (int): The index of the current subtitle within the segment.
-            start_time (float): Start time of the subtitle in seconds.
-            end_time (float): End time of the subtitle in seconds.
-            text (str): Subtitle text.
-        """
-        temp_subtitles_path = f'output/subtitles/subtitles_segment_{self.segment_index}.vtt'
+    async def write_vtt_subtitle(self, segment_index: int, start_time: float, end_time: float, text: str):
+        temp_subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.vtt'
         try:
             # Convert seconds to WebVTT timestamp format HH:MM:SS.mmm.
             start_vtt = format_timestamp_vtt(start_time)
             end_vtt = format_timestamp_vtt(end_time)
 
             # Prepare subtitle entry.
-            subtitle = f"{index}\n{start_vtt} --> {end_vtt}\n{text}\n\n"
+            subtitle_index = await self.get_next_subtitle_index(segment_index)
+            subtitle = f"{subtitle_index}\n{start_vtt} --> {end_vtt}\n{text}\n\n"
 
             # Append to the temporary WebVTT file.
             async with aiofiles.open(temp_subtitles_path, 'a', encoding='utf-8') as f:
                 await f.write(subtitle)
-            self.logger.debug(f"Written subtitle {index} to {temp_subtitles_path}.")
+            self.logger.debug(f"Written subtitle {subtitle_index} to {temp_subtitles_path}.")
         except Exception as e:
-            self.logger.error(f"Error writing WebVTT subtitle {index} to {temp_subtitles_path}: {e}")
+            self.logger.error(f"Error writing WebVTT subtitle {subtitle_index} to {temp_subtitles_path}: {e}")
+
+
+    async def get_next_subtitle_index(self, segment_index: int) -> int:
+        """Get the next subtitle index for the given segment."""
+        if not hasattr(self, 'subtitle_indices'):
+            self.subtitle_indices = {}
+        self.subtitle_indices.setdefault(segment_index, 0)
+        self.subtitle_indices[segment_index] += 1
+        return self.subtitle_indices[segment_index]
+
 
     async def run_dashboard_server(self):
         """Run the real-time monitoring dashboard using aiohttp."""
@@ -727,6 +743,10 @@ class OpenAIClient:
         except Exception as e:
             self.logger.error(f"Initial connection failed: {e}")
             await self.reconnect()
+
+        # Initialize the first audio segment and subtitle file
+        await self.initialize_temp_subtitles(self.segment_index)
+        await self.audio_processor.start_new_audio_segment(self.segment_index)
 
         # Start message sender
         send_task = asyncio.create_task(self.send_messages())
@@ -759,6 +779,7 @@ class OpenAIClient:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+
 
     async def heartbeat(self):
         """Send periodic heartbeat pings to keep the WebSocket connection alive."""

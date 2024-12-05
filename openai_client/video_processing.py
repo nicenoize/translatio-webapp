@@ -1,13 +1,9 @@
-# openai_client/video_processing.py
-
 import asyncio
 import cv2
 import time
 import os
-import wave
 import logging
 from config import STREAM_URL, SEGMENT_DURATION
-from collections import deque
 
 class VideoProcessor:
     def __init__(self, client, logger: logging.Logger):
@@ -21,7 +17,7 @@ class VideoProcessor:
         await asyncio.to_thread(self.start_video_processing)
 
     def start_video_processing(self):
-        """Start video processing with OpenCV and dynamic subtitle overlay."""
+        """Start video processing with OpenCV."""
         try:
             self.logger.info("Starting video processing with OpenCV.")
 
@@ -43,15 +39,15 @@ class VideoProcessor:
 
             self.logger.info(f"Video properties - FPS: {fps}, Width: {width}, Height: {height}")
 
-            # Initialize variables for video segmentation
-            segment_frames = round(fps * self.segment_duration)
-            frame_count = 0
-            self.segment_start_time = time.perf_counter()
-
-            if self.client.video_start_time is None:
-                self.client.video_start_time = self.segment_start_time
-
             while self.client.running:
+                # Initialize frame count for this segment
+                frame_count = 0
+                frames_written = 0
+                self.segment_start_time = time.perf_counter()
+
+                if self.client.video_start_time is None:
+                    self.client.video_start_time = self.segment_start_time
+
                 # Retrieve current segment_index safely
                 try:
                     current_segment_index_future = asyncio.run_coroutine_threadsafe(
@@ -76,23 +72,10 @@ class VideoProcessor:
 
                 self.logger.info(f"Started recording segment {current_segment_index} to {segment_output_path}")
 
-                # Initialize the corresponding audio segment file
-                audio_segment_path = f'output/audio/output_audio_segment_{current_segment_index}.wav'
-                try:
-                    os.makedirs(os.path.dirname(audio_segment_path), exist_ok=True)
-                    wf = wave.open(audio_segment_path, 'wb')
-                    wf.setnchannels(self.client.AUDIO_CHANNELS)
-                    wf.setsampwidth(self.client.AUDIO_SAMPLE_WIDTH)
-                    wf.setframerate(self.client.AUDIO_SAMPLE_RATE)
-                    self.client.current_audio_segment_wf = wf
-                    self.logger.debug(f"Initialized audio segment file: {audio_segment_path}")
-                except Exception as e:
-                    self.logger.error(f"Failed to initialize audio segment file {audio_segment_path}: {e}", exc_info=True)
-                    out.release()
-                    self.client.current_audio_segment_wf = None
-                    continue
+                # Calculate the number of frames per segment
+                segment_frames = round(fps * self.segment_duration)
 
-                frames_written = 0
+                # Record frames for the current segment
                 while frame_count < segment_frames and self.client.running:
                     ret, frame = cap.read()
                     if not ret:
@@ -108,48 +91,20 @@ class VideoProcessor:
                 out.release()
                 self.logger.info(f"Segment {current_segment_index} saved to {segment_output_path}. Frames written: {frames_written}")
 
-                # Log file sizes
+                # Log file size
                 try:
                     video_size = os.path.getsize(segment_output_path)
-                    audio_size = os.path.getsize(audio_segment_path)
                     self.logger.info(f"Video segment size: {video_size} bytes")
-                    self.logger.info(f"Audio segment size: {audio_size} bytes")
                 except Exception as e:
-                    self.logger.error(f"Error getting file sizes: {e}")
+                    self.logger.error(f"Error getting file size: {e}")
 
-                # Close the audio WAV file
-                try:
-                    wf.close()
-                    self.client.current_audio_segment_wf = None
-                    self.logger.debug(f"Closed audio segment file: {audio_segment_path}")
-                except Exception as e:
-                    self.logger.error(f"Failed to close audio segment file {audio_segment_path}: {e}")
-
-                # Enqueue muxing job
-                final_output_path = f'output/final/output_final_segment_{current_segment_index}.mp4'
-                muxing_job = {
-                    "segment_index": current_segment_index,
-                    "video": segment_output_path,
-                    "audio": audio_segment_path,
-                    "subtitles": f'output/subtitles/subtitles_segment_{current_segment_index}.vtt',
-                    "output": final_output_path
-                }
-                asyncio.run_coroutine_threadsafe(
-                    self.client.muxer.enqueue_muxing_job(muxing_job),
-                    self.client.loop
-                )
-
-                # Reset for next segment
-                frame_count = 0
-                self.segment_start_time = time.perf_counter()
-
-                # Increment the segment index
+                # Increment the segment index in the client
                 try:
                     asyncio.run_coroutine_threadsafe(
                         self.client.increment_segment_index(),
                         self.client.loop
                     ).result()
-                    self.logger.info(f"Moved to next segment index: {current_segment_index + 1}")
+                    self.logger.info("Segment index incremented.")
                 except Exception as e:
                     self.logger.error(f"Error incrementing segment index: {e}")
                     self.client.running = False
