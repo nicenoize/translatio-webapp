@@ -30,6 +30,7 @@ from logging_setup import setup_logging
 from .audio_processing import AudioProcessor
 from .video_processing import VideoProcessor
 from .muxing import Muxer
+from .rtmp_streamer import RTMPStreamer
 from .dashboard import Dashboard
 from .utils import format_timestamp_vtt
 
@@ -122,6 +123,10 @@ class OpenAIClient:
         # WebSocket clients management
         self.websocket_clients: Set[websockets.WebSocketServerProtocol] = set()
         self.websocket_clients_lock = asyncio.Lock()
+
+        # Initialize RTMPStreamer
+        self.rtmp_streamer = RTMPStreamer(self, self.logger)
+
 
         # Ensure all necessary directories exist
         os.makedirs('output/audio/responses', exist_ok=True)
@@ -794,8 +799,12 @@ class OpenAIClient:
             await self.reconnect()
 
         # Initialize the first audio segment and subtitle file
-        await self.initialize_temp_subtitles(self.segment_index)
-        await self.audio_processor.start_new_audio_segment(self.segment_index)
+        await self.initialize_temp_subtitles(self.segment_index + 1)
+        await self.audio_processor.start_new_audio_segment(self.segment_index + 1)
+
+        # Reset the current transcript for the next segment
+        self.current_transcript = ""
+        self.logger.debug("Reset current transcript for the next segment.")
 
         # Start message sender
         send_task = asyncio.create_task(self.send_messages())
@@ -809,6 +818,9 @@ class OpenAIClient:
         # Start heartbeat
         heartbeat_task = asyncio.create_task(self.heartbeat())
 
+        # Start RTMPStreamer
+        self.rtmp_streamer.start()
+
         # Wait for all tasks to complete
         done, pending = await asyncio.wait(
             [
@@ -818,10 +830,14 @@ class OpenAIClient:
                 heartbeat_task,
                 self.audio_processor.playback_task,
                 self.muxer.muxing_task,
-                self.dashboard.dashboard_task
+                self.dashboard.dashboard_task,
+                self.rtmp_streamer.streaming_task
             ],
             return_when=asyncio.FIRST_EXCEPTION
         )
+
+        # Stop RTMPStreamer
+        self.rtmp_streamer.stop()
 
         # Cancel pending tasks
         for task in pending:
