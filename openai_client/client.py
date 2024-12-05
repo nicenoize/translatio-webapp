@@ -283,7 +283,8 @@ class OpenAIClient:
                 "voice": self.DEFAULT_VOICE_ID,
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "temperature": 1.08,
+                # "turn_detection": null,
+                "temperature": 1.02,
                 "tools": []  # Add tool definitions here if needed
             }
         }
@@ -478,7 +479,12 @@ class OpenAIClient:
                 await self.log_delay_metrics()
 
                 current_segment_index = await self.get_segment_index()
-                video_segment_index = current_segment_index - 1  # Video segment corresponds to previous index
+                video_segment_index = current_segment_index - 1  # Adjust for zero-based index
+
+                start_time = (video_segment_index) * self.SEGMENT_DURATION
+                end_time = (video_segment_index + 1) * self.SEGMENT_DURATION
+
+                self.logger.info(f"Subtitle timing - Start: {start_time:.3f}s, End: {end_time:.3f}s")
 
                 # Write subtitle to temporary WebVTT file
                 await self.write_vtt_subtitle(current_segment_index, start_time, end_time, transcript)
@@ -490,14 +496,14 @@ class OpenAIClient:
                 # Close the current audio segment
                 await self.audio_processor.close_current_audio_segment(video_segment_index)
 
-                # Enqueue muxing job
+                # Enqueue muxing job with audio_offset set to zero
                 muxing_job = {
                     "segment_index": video_segment_index,
                     "video": f'output/video/output_video_segment_{video_segment_index}.mp4',
                     "audio": f'output/audio/output_audio_segment_{video_segment_index}.wav',
                     "subtitles": f'output/subtitles/subtitles_segment_{video_segment_index}.vtt',
                     "output": f'output/final/output_final_segment_{video_segment_index}.mp4',
-                    "audio_offset": audio_offset  # Default to 0 if no delay recorded
+                    "audio_offset": 0.0  # Set audio offset to zero
                 }
                 await self.enqueue_muxing_job(muxing_job)
                 self.logger.info(f"Enqueued muxing job for segment {video_segment_index}")
@@ -655,6 +661,7 @@ class OpenAIClient:
                         "Provide detailed and comprehensive translations without truncating sentences. "
                         "Do not respond conversationally."
                     ),
+                    # "turn_detection": null,
                     "voice": selected_voice,
                     "tools": []  # Add tool definitions here if needed
                 }
@@ -729,9 +736,13 @@ class OpenAIClient:
                             await self.audio_processor.send_input_audio(segment)
                             self.logger.info(f"Sent audio segment of size: {len(segment)} bytes.")
 
+                            # Commit the audio buffer after each segment
+                            await self.commit_audio_buffer()
+
             except Exception as e:
                 self.logger.error(f"Error reading input audio: {e}")
                 await asyncio.sleep(1)  # Prevent tight loop on error
+
 
 
     async def write_vtt_subtitle(self, segment_index: int, start_time: float, end_time: float, text: str):
