@@ -12,103 +12,147 @@ class RTMPStreamer:
         client: 'OpenAIClient',
         logger: logging.Logger,
         audio_input: str = 'output/audio/output.wav',
-        rtmp_url: str = 'rtmp://bintu-vtrans.nanocosmos.de/live/sNVi5-egEGF',
-        buffer_duration: int = 5,  # Buffer duration in seconds
+        subtitles_input: str = 'output/subtitles/master_subtitles.vtt',
+        output_file: str = 'output/final/output_with_subs.mp4',
+        buffer_duration: int = 5,
     ):
         """
-        Initialize the RTMPStreamer.
+        Prepare a local MP4 file with audio, colored background video, and subtitles.
+        Once this works, we can adapt it for live streaming.
 
         Args:
             client (OpenAIClient): Reference to the OpenAIClient instance.
             logger (logging.Logger): Logger instance.
-            audio_input (str): Path to the seamless audio file.
-            rtmp_url (str): RTMP server URL to stream to.
-            buffer_duration (int): Delay in seconds to buffer the stream before starting.
+            audio_input (str): Path to the audio file.
+            subtitles_input (str): Path to the subtitles file (WebVTT).
+            output_file (str): Path to the output MP4 file to be created.
+            buffer_duration (int): Time to wait before processing (simulate buffering).
         """
         self.client = client
         self.logger = logger
         self.audio_input = audio_input
-        self.rtmp_url = rtmp_url
+        self.subtitles_input = subtitles_input
+        self.output_file = output_file
         self.buffer_duration = buffer_duration
-        self.ffmpeg_process: Optional[asyncio.subprocess.Process] = None
         self.running = True
-        self.streaming_task = None
 
-    def start(self):
-        """Start the RTMPStreamer."""
-        if self.streaming_task is None or self.streaming_task.done():
-            self.streaming_task = asyncio.create_task(self.stream_audio_colored_bg())
-            self.logger.info("RTMPStreamer started.")
-
-    def stop(self):
-        """Stop the RTMPStreamer."""
-        self.running = False
-        if self.ffmpeg_process and self.ffmpeg_process.returncode is None:
-            self.ffmpeg_process.terminate()
-            self.logger.info("FFmpeg streaming process terminated.")
-        if self.streaming_task:
-            self.streaming_task.cancel()
-            self.logger.info("RTMPStreamer streaming task cancelled.")
-
-    async def stream_audio_colored_bg(self):
-        """Stream the audio with a colored video background (no subtitles yet)."""
+    async def create_local_file(self):
+        """Create a local MP4 file that combines a colored background, audio, and subtitles."""
         try:
-            # Wait for the audio_input file to appear
+            self.logger.info("Starting local file creation process.")
+
+            # Wait until audio file exists
             while not os.path.exists(self.audio_input):
-                if not self.running:
-                    self.logger.info("Stopped before audio input was available.")
-                    return
-                self.logger.info("Waiting for audio input to be available...")
+                self.logger.info(f"Waiting for audio file to appear at {self.audio_input}...")
                 await asyncio.sleep(1)
+                if not self.running:
+                    self.logger.info("Local file creation process was stopped before audio file was found.")
+                    return
 
-            # Introduce buffering delay before starting
-            self.logger.info(f"Buffering for {self.buffer_duration} seconds before starting the stream...")
+            self.logger.info(f"Audio file found at {self.audio_input}.")
+
+            # Wait until subtitles file exists
+            while not os.path.exists(self.subtitles_input):
+                self.logger.info(f"Waiting for subtitles file to appear at {self.subtitles_input}...")
+                await asyncio.sleep(1)
+                if not self.running:
+                    self.logger.info("Local file creation process was stopped before subtitles file was found.")
+                    return
+
+            self.logger.info(f"Subtitles file found at {self.subtitles_input}.")
+
+            # Simulate buffering
+            self.logger.info(f"Buffering for {self.buffer_duration} seconds before creating local file...")
             await asyncio.sleep(self.buffer_duration)
+            self.logger.info("Buffering complete.")
 
-            # Change the background color here (e.g., blue)
+            # Ensure output directory exists
+            output_dir = os.path.dirname(self.output_file)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                self.logger.info(f"Ensured that output directory exists: {output_dir}")
+
+            # Verify input files
+            if not os.path.isfile(self.audio_input):
+                self.logger.error(f"Audio input file does not exist: {self.audio_input}")
+                return
+
+            if not os.path.isfile(self.subtitles_input):
+                self.logger.warning(f"Subtitles input file does not exist: {self.subtitles_input}. Subtitles will be skipped.")
+                subtitles_filter = ""
+            else:
+                subtitles_filter = f"subtitles='{os.path.abspath(self.subtitles_input)}'"
+
+            # Prepare FFmpeg filter
+            if subtitles_filter:
+                video_filter = subtitles_filter
+            else:
+                video_filter = ""
+
+            # Build FFmpeg command
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-re',  # Read input at native frame rate
-                '-i', self.audio_input,  # Input audio file
+                '-y',  # Overwrite output file if it exists
+                '-i', self.audio_input,  # Input audio
                 '-f', 'lavfi',
-                '-i', 'color=size=1280x720:rate=25:color=blue',  # Blue video background
-                '-c:v', 'libx264',  # Video codec
-                '-preset', 'veryfast',
-                '-maxrate', '3000k',
-                '-bufsize', '6000k',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',  # Audio codec
-                '-b:a', '160k',
-                '-f', 'flv',    # Output format
-                self.rtmp_url   # RTMP server URL
+                '-i', 'color=size=1280x720:rate=25:color=blue',  # Colored background video
             ]
 
-            self.logger.info(f"Starting FFmpeg streaming to RTMP server: {self.rtmp_url}")
-            self.logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
+            if video_filter:
+                ffmpeg_cmd.extend([
+                    '-vf', video_filter,
+                ])
+            else:
+                self.logger.info("No subtitles filter applied; proceeding without subtitles.")
 
-            self.ffmpeg_process = await asyncio.create_subprocess_exec(
+            # Add encoding options
+            ffmpeg_cmd.extend([
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac',
+                '-b:a', '160k',
+                self.output_file
+            ])
+
+            self.logger.info("Running FFmpeg to create local MP4 file...")
+            self.logger.debug("FFmpeg command: " + " ".join(ffmpeg_cmd))
+
+            # Execute FFmpeg command
+            process = await asyncio.create_subprocess_exec(
                 *ffmpeg_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
 
-            while self.running:
-                retcode = await self.ffmpeg_process.poll()
-                if retcode is not None:
-                    # FFmpeg has exited
-                    stdout, stderr = await self.ffmpeg_process.communicate()
-                    self.logger.error(f"FFmpeg terminated with code {retcode}")
-                    self.logger.error(f"FFmpeg stderr: {stderr.decode('utf-8', errors='replace')}")
-                    break
-                await asyncio.sleep(1)
+            self.logger.info("FFmpeg process started. Awaiting completion...")
 
-        except asyncio.CancelledError:
-            self.logger.info("Streaming task cancelled.")
+            stdout, stderr = await process.communicate()
+
+            # Log FFmpeg output for debugging
+            if stdout:
+                self.logger.debug(f"FFmpeg stdout: {stdout.decode('utf-8', errors='replace')}")
+            if stderr:
+                self.logger.debug(f"FFmpeg stderr: {stderr.decode('utf-8', errors='replace')}")
+
+            if process.returncode != 0:
+                self.logger.error(f"FFmpeg failed with exit code {process.returncode}.")
+                self.logger.error(f"FFmpeg stderr: {stderr.decode('utf-8', errors='replace')}")
+            else:
+                self.logger.info(f"Successfully created local MP4 file: {self.output_file}")
+
+        except FileNotFoundError as fnf_error:
+            self.logger.error(f"FFmpeg not found: {fnf_error}. Ensure FFmpeg is installed and in the system PATH.")
         except Exception as e:
-            self.logger.error(f"Error during FFmpeg streaming: {e}")
-        finally:
-            # Clean up if needed
-            if self.ffmpeg_process and self.ffmpeg_process.returncode is None:
-                self.ffmpeg_process.terminate()
-                await self.ffmpeg_process.wait()
-                self.logger.info("FFmpeg streaming process terminated at cleanup.")
+            self.logger.error(f"Error during local file creation: {e}")
+
+    def start(self):
+        """Start the file creation process."""
+        self.logger.info("Starting local file creation task.")
+        asyncio.create_task(self.create_local_file())
+        self.logger.info("Local file creation task has been initiated.")
+
+    def stop(self):
+        """Stop the process if running."""
+        self.running = False
+        self.logger.info("Stopped local file creation process.")

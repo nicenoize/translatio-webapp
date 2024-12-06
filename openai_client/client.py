@@ -42,7 +42,7 @@ class OpenAIClient:
         self.api_key = api_key
         self.loop = asyncio.get_event_loop()
         self.session_id = str(uuid.uuid4())
-        self.logger, self.muxing_logger = setup_logging(self.session_id)
+        self.logger, self.muxing_logger, self.rtmp_logger = setup_logging(self.session_id)
         self.ws = None
         self.running = True
 
@@ -125,7 +125,14 @@ class OpenAIClient:
         self.websocket_clients_lock = asyncio.Lock()
 
         # Initialize RTMPStreamer
-        self.rtmp_streamer = RTMPStreamer(self, self.logger)
+        self.rtmp_streamer = RTMPStreamer(
+            client=self,
+            logger=self.rtmp_logger,
+            audio_input='output/audio/output.wav',
+            subtitles_input='output/subtitles/master_subtitles.vtt',
+            output_file='output/final/output_with_subs.mp4',
+            buffer_duration=5
+        )
 
 
         # Ensure all necessary directories exist
@@ -831,7 +838,7 @@ class OpenAIClient:
                 self.audio_processor.playback_task,
                 self.muxer.muxing_task,
                 self.dashboard.dashboard_task,
-                self.rtmp_streamer.streaming_task
+                self.rtmp_streamer.streaming_task  # Ensure RTMPStreamer has a streaming_task attribute
             ],
             return_when=asyncio.FIRST_EXCEPTION
         )

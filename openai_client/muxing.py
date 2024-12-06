@@ -173,17 +173,28 @@ class Muxer:
                 'ffmpeg', '-y',
                 '-i', video_path,
                 '-itsoffset', str(audio_offset), '-i', audio_path,
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-strict', 'experimental',
-                '-map', '0:v', '-map', '1:a'
             ]
 
-            # Add subtitles if they exist
+            # Initialize codec options
             if os.path.exists(subtitles_path):
-                command.extend(['-vf', f"subtitles={subtitles_path}:force_style='FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF&'"])
+                # If subtitles are present, apply filter and set video codec to libx264
+                command.extend([
+                    '-vf', f"subtitles={subtitles_path}:force_style='FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF&'",
+                    '-c:v', 'libx264',  # Specify a codec that allows re-encoding
+                ])
+            else:
+                # If no subtitles, copy the video stream
+                command.extend([
+                    '-c:v', 'copy',
+                ])
 
-            command.append(output_path)
+            # Always set audio codec to AAC
+            command.extend([
+                '-c:a', 'aac',
+                '-strict', 'experimental',
+                '-map', '0:v', '-map', '1:a',
+                output_path
+            ])
 
             # Log the FFmpeg command
             self.logger.debug(f"Running FFmpeg command: {' '.join(command)}")
@@ -210,6 +221,7 @@ class Muxer:
                 self.logger.error(f"FFmpeg failed for segment {segment_index}. Error: {process.stderr}")
         except Exception as e:
             self.logger.error(f"Error running FFmpeg for segment {segment_index}: {e}")
+
 
     def vtt_timestamp_to_seconds(self, timestamp: str) -> float:
         """Convert VTT timestamp to seconds."""
