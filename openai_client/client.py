@@ -5,7 +5,6 @@ import aiofiles
 import websockets
 import json
 import os
-import base64
 import wave
 import uuid
 import csv
@@ -15,9 +14,7 @@ import numpy as np
 from asyncio import Queue
 from collections import deque
 import datetime
-import time
 from contextlib import suppress
-import logging
 from typing import Optional, Dict, Any, Set
 import shutil
 
@@ -161,10 +158,6 @@ class OpenAIClient:
     ]
 
     clear_directories(directories_to_clear)
-
-
-
-
 
     async def get_segment_index(self) -> int:
         """Safely get the current segment index."""
@@ -406,11 +399,6 @@ class OpenAIClient:
         if event_type == "input_audio_buffer.speech_started":
             self.logger.info("Speech started detected by server.")
 
-        elif event_type == "response.text.delta":
-            delta_text = event.get("delta", "")
-            self.logger.info(f"Received text delta: '{delta_text}'")
-            self.current_transcript += delta_text
-
         # elif event_type == "input_audio_buffer.speech_stopped":
         #     self.logger.info("Speech stopped detected by server.")
         #     await self.commit_audio_buffer()
@@ -421,10 +409,15 @@ class OpenAIClient:
                 self.logger.info("Function call detected.")
                 await self.handle_function_call(item)
 
+        # elif event_type == "response.text.delta":
+        #     delta_text = event.get("delta", "")
+        #     self.logger.info(f"Received text delta: '{delta_text}'")
+        #     self.current_transcript += delta_text
+
         elif event_type == "response.audio.delta":
             audio_data = event.get("delta", "")
             if audio_data:
-                # We implement a simple check to avoid duplicates:
+                # simple check to avoid duplicates:
                 # Keep track of the last audio delta received and skip if identical.
                 if hasattr(self, 'last_audio_delta') and self.last_audio_delta == audio_data:
                     self.logger.debug("Received duplicate audio delta, skipping.")
@@ -490,7 +483,6 @@ class OpenAIClient:
             rate_limits = event.get("rate_limits", [])
             self.logger.info(f"Rate limits updated: {rate_limits}")
 
-        # Handle other events as needed...
         else:
             self.logger.debug(f"No handler for event type: {event_type}")
 
