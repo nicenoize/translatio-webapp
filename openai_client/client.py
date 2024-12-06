@@ -124,11 +124,8 @@ class OpenAIClient:
 
         # Initialize RTMPStreamer
         self.rtmp_streamer = RTMPStreamer(
-            client=self,
             logger=self.rtmp_logger,
-            audio_input='output/audio/output.wav',
-            subtitles_input='output/subtitles/master_subtitles.srt',
-            output_file='output/final/output_with_subs.mp4',
+            segments_dir='output/final/',
             buffer_duration=5
         )
 

@@ -86,7 +86,7 @@ class Muxer:
 
             if os.path.exists(subtitles_path):
                 command.extend([
-                    '-vf', f"subtitles={subtitles_path}:force_style='FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF&'",
+                    '-vf', f"subtitles={subtitles_path}:force_style='FontName=Arial,FontSize=24,PrimaryColour=&HFFFFFF&,Alignment=5'",
                     '-c:v', 'libx264'
                 ])
             else:
