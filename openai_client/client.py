@@ -19,6 +19,7 @@ import time
 from contextlib import suppress
 import logging
 from typing import Optional, Dict, Any, Set
+import shutil
 
 from config import (
     API_URL, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_SAMPLE_WIDTH,
@@ -124,6 +125,7 @@ class OpenAIClient:
 
         # Initialize RTMPStreamer
         self.rtmp_streamer = RTMPStreamer(
+            client=self,
             logger=self.rtmp_logger,
             segments_dir='output/final/',
             buffer_duration=5
@@ -135,6 +137,35 @@ class OpenAIClient:
         os.makedirs('output/subtitles', exist_ok=True)
         os.makedirs('output/final', exist_ok=True)
         os.makedirs('output/logs', exist_ok=True)
+
+    
+
+    def clear_directories(directories):
+        """
+        Clears the specified directories by deleting and recreating them.
+
+        Args:
+            directories (list): List of directory paths to clear.
+        """
+        for directory in directories:
+            if os.path.exists(directory):
+                shutil.rmtree(directory)  # Delete the directory and all its contents
+            os.makedirs(directory, exist_ok=True)  # Recreate the directory
+            print(f"Cleared and recreated directory: {directory}")
+
+    # Example usage
+    directories_to_clear = [
+        'output/audio/',
+        'output/subtitles',
+        'output/logs',
+        'output/video/'
+    ]
+
+    clear_directories(directories_to_clear)
+
+
+
+
 
     async def get_segment_index(self) -> int:
         """Safely get the current segment index."""
