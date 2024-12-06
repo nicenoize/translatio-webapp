@@ -284,7 +284,7 @@ class OpenAIClient:
             "type": "session.update",
             "session": {
                 "instructions": (
-                    "You are a real-time translator. Translate the audio you receive into German without performing Voice Activity Detection (VAD). "
+                    "You are a real-time translator. Translate the audio you receive into English without performing Voice Activity Detection (VAD). "
                     "Ensure that the translated audio matches the input audio's duration and timing exactly to facilitate synchronization with video. "
                     "If there is silence, or no one speaking, please fill this space with silence in order to keep the same output length as input length. "
                     "If there are multiple people speaking, please try to use different voices for each of them. "
@@ -296,7 +296,7 @@ class OpenAIClient:
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
                 # "turn_detection": null,
-                "temperature": 1.02,
+                "temperature": 0.87,
                 "tools": []  # Add tool definitions here if needed
             }
         }
@@ -668,7 +668,7 @@ class OpenAIClient:
                 "response": {
                     "modalities": ["text", "audio"],
                     "instructions": (
-                        "You are a real-time translator. Translate the audio you receive into German without performing Voice Activity Detection (VAD). "
+                        "You are a real-time translator. Translate the audio you receive into English without performing Voice Activity Detection (VAD). "
                         "Ensure that the translated audio matches the input audio's duration and timing exactly to facilitate synchronization with video. "
                         "Provide detailed and comprehensive translations without truncating sentences. "
                         "Do not respond conversationally."
@@ -806,8 +806,8 @@ class OpenAIClient:
             await self.reconnect()
 
         # Initialize the first audio segment and subtitle file
-        await self.initialize_temp_subtitles(self.segment_index + 1)
-        await self.audio_processor.start_new_audio_segment(self.segment_index + 1)
+        await self.initialize_temp_subtitles(self.segment_index)
+        await self.audio_processor.start_new_audio_segment(self.segment_index)
 
         # Reset the current transcript for the next segment
         self.current_transcript = ""
