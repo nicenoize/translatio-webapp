@@ -6,8 +6,8 @@ set -euo pipefail
 # Check if port 8000 is in use and kill the process
 if lsof -i :8000 -t >/dev/null; then
     echo "Port 8000 is in use. Attempting to free it..."
-    lsof -i :8000 -t | xargs kill -9
-    lsof -i :8080 -t | xargs kill -9
+    lsof -i :8000 -t | xargs kill -9 || true
+    lsof -i :8080 -t | xargs kill -9 || true
     echo "Port 8000 has been freed."
 fi
 
@@ -16,6 +16,7 @@ PROJECT_DIR="/Users/seebo/Documents/Uni/Masterarbeit/repo/translatio-webapp"
 
 # Define named pipes with absolute paths
 INPUT_AUDIO_PIPE="$PROJECT_DIR/input_audio_pipe"
+OUTPUT_AUDIO_PIPE="$PROJECT_DIR/output/audio/output.pcm"
 
 # Define log files with absolute paths
 APP_LOG="$PROJECT_DIR/output/logs/app.log"
@@ -40,15 +41,16 @@ create_pipe() {
 
 # Create required pipes
 create_pipe "$INPUT_AUDIO_PIPE"
+create_pipe "$OUTPUT_AUDIO_PIPE"
 
 # Ensure pipes have correct permissions
-chmod 666 "$INPUT_AUDIO_PIPE" 
+chmod 666 "$INPUT_AUDIO_PIPE"
 
 # Clear existing log files to prevent them from becoming too large
 truncate -s 0 "$APP_LOG" "$STREAM_AUDIO_PROCESSOR_LOG" "$MAIN_LOG"
 echo "Cleared existing log files."
 
-# Start FFmpeg Audio Pipe
+# Start FFmpeg Audio Pipe (Extract audio from the original stream)
 ffmpeg -y -re -fflags nobuffer -flags low_delay \
     -i "https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t" \
     -vn -acodec pcm_s16le -ac 1 -ar 24000 -f s16le \
@@ -67,14 +69,15 @@ echo "Started Python application with PID: $PYTHON_PID"
 cleanup() {
     echo "Cleaning up..."
     # Kill all background processes
-    kill "$FFMPEG_AUDIO_PID" "$PYTHON_PID" 2>/dev/null || true
-    # Optionally, wait for them to terminate
-    wait "$FFMPEG_AUDIO_PID" "$PYTHON_PID" 2>/dev/null || true
+    kill "$FFMPEG_AUDIO_PID" "$PYTHON_PID" "$FFMPEG_STREAM_PID" 2>/dev/null || true
+    wait "$FFMPEG_AUDIO_PID" "$PYTHON_PID" "$FFMPEG_STREAM_PID" 2>/dev/null || true
+    
     # Remove named pipes
     rm -f "$INPUT_AUDIO_PIPE"
 
-    lsof -i :8000 -t | xargs kill -9
-    lsof -i :8080 -t | xargs kill -9
+    # Kill any lingering processes on ports 8000 and 8080
+    lsof -i :8000 -t | xargs kill -9 || true
+    lsof -i :8080 -t | xargs kill -9 || true
     
     echo "Cleanup complete."
 }
