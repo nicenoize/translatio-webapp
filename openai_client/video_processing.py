@@ -15,15 +15,11 @@ class VideoProcessor:
         self.video_task = asyncio.create_task(self.run_video_processing())
 
     async def run_video_processing(self):
-        """Run video processing within the asyncio event loop."""
         await asyncio.to_thread(self.start_video_processing)
 
     def start_video_processing(self):
-        """Start video processing with OpenCV."""
         try:
             self.logger.info("Starting video processing with OpenCV.")
-
-            # Open video capture
             cap = cv2.VideoCapture(STREAM_URL)
 
             if not cap.isOpened():
@@ -31,10 +27,9 @@ class VideoProcessor:
                 self.client.running = False
                 return
 
-            # Get video properties
             fps = cap.get(cv2.CAP_PROP_FPS)
-            if fps == 0 or fps is None or fps != fps:  # Check for NaN
-                fps = 30.0  # Default FPS if unable to get from stream
+            if fps == 0 or fps is None or fps != fps:
+                fps = 30.0
                 self.logger.warning(f"Unable to get FPS from stream. Defaulting to {fps} FPS.")
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
@@ -42,16 +37,13 @@ class VideoProcessor:
             self.logger.info(f"Video properties - FPS: {fps}, Width: {width}, Height: {height}")
 
             while self.client.running:
-                # Initialize frame count for this segment
                 frame_count = 0
                 frames_written = 0
                 segment_start_time = time.perf_counter()
 
                 if self.client.video_start_time is None:
                     self.client.video_start_time = segment_start_time
-                    self.logger.debug(f"Set video_start_time to {self.client.video_start_time}")
 
-                # Retrieve current segment_index safely
                 try:
                     current_segment_index_future = asyncio.run_coroutine_threadsafe(
                         self.client.get_segment_index(),
@@ -63,7 +55,6 @@ class VideoProcessor:
                     self.client.running = False
                     break
 
-                # Define video writer for each segment
                 segment_output_path = f'output/video/output_video_segment_{current_segment_index}.mp4'
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 
@@ -75,11 +66,8 @@ class VideoProcessor:
 
                 self.logger.info(f"Started recording segment {current_segment_index} to {segment_output_path}")
 
-                # Calculate the number of frames per segment
                 segment_frames = round(fps * self.segment_duration)
-                self.logger.debug(f"Segment frames to capture: {segment_frames}")
 
-                # Record frames for the current segment
                 while frame_count < segment_frames and self.client.running:
                     ret, frame = cap.read()
                     if not ret:
@@ -88,21 +76,16 @@ class VideoProcessor:
                     out.write(frame)
                     frame_count += 1
                     frames_written += 1
-                    if frames_written % int(fps) == 0:
-                        self.logger.debug(f"Written {frames_written} frames to segment {current_segment_index}.")
 
-                # Release the video writer
                 out.release()
-                self.logger.info(f"Segment {current_segment_index} saved to {segment_output_path}. Frames written: {frames_written}")
+                self.logger.info(f"Segment {current_segment_index} saved to {segment_output_path}. Frames: {frames_written}")
 
-                # Log file size
                 try:
                     video_size = os.path.getsize(segment_output_path)
                     self.logger.info(f"Video segment size: {video_size} bytes")
                 except Exception as e:
                     self.logger.error(f"Error getting file size: {e}")
 
-                # Increment the segment index in the client
                 try:
                     asyncio.run_coroutine_threadsafe(
                         self.client.increment_segment_index(),

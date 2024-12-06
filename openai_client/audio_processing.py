@@ -1,3 +1,5 @@
+# openai_client/audio_processing.py
+
 import asyncio
 import base64
 import wave
@@ -9,9 +11,9 @@ import numpy as np
 import logging
 from typing import Optional
 from .utils import format_timestamp_vtt
-from config import AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_WIDTH, SEGMENT_DURATION
+from config import AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_WIDTH
 from collections import deque
-import aiofiles  # Ensure aiofiles is imported
+import aiofiles
 
 class AudioProcessor:
     def __init__(self, client, logger: logging.Logger, initial_buffer_size: int = 5):
@@ -19,30 +21,28 @@ class AudioProcessor:
         self.logger = logger
         self.translated_audio_queue = Queue()
         self.audio_buffer = deque(maxlen=100)
-        self.segment_lock = asyncio.Lock()  # To synchronize access to segments
+        self.segment_lock = asyncio.Lock()
         self.output_audio_path = os.environ.get('OUTPUT_AUDIO_PIPE')
         self.initial_buffer_size = initial_buffer_size
         self.playback_started = False
         self.playback_task = asyncio.create_task(self.audio_playback_handler())
 
     async def write_to_output_audio_pipe(self, audio_data: bytes):
-        """Write audio data to the output audio named pipe for streaming."""
         try:
-            async with aiofiles.open(self.output_audio_path, 'ab') as f:
-                await f.write(audio_data)
-            self.logger.debug("Written audio data to output audio pipe.")
+            if self.output_audio_path:
+                async with aiofiles.open(self.output_audio_path, 'ab') as f:
+                    await f.write(audio_data)
+                self.logger.debug("Written audio data to output audio pipe.")
         except Exception as e:
             self.logger.error(f"Error writing to output audio pipe: {e}")
 
     async def handle_audio_delta(self, audio_data: str):
-        """Handle incoming audio delta from the server."""
         try:
             decoded_audio = base64.b64decode(audio_data)
             if not decoded_audio:
                 self.logger.warning("Decoded audio data is empty.")
                 return
 
-            # Save raw audio for verification
             response_audio_filename = f"{uuid.uuid4()}.wav"
             response_audio_path = os.path.join('output/audio/responses', response_audio_filename)
             os.makedirs(os.path.dirname(response_audio_path), exist_ok=True)
@@ -53,7 +53,6 @@ class AudioProcessor:
                 wf_response.writeframes(decoded_audio)
             self.logger.info(f"Saved raw audio response to {response_audio_path}")
 
-            # Enqueue audio for playback
             await self.translated_audio_queue.put(decoded_audio)
             self.logger.debug("Enqueued translated audio for playback.")
 
@@ -61,7 +60,6 @@ class AudioProcessor:
             self.logger.error(f"Error handling audio delta: {e}")
 
     async def send_input_audio(self, audio_data: bytes):
-        """Send input audio to the Realtime API and record the send time."""
         try:
             pcm_base64 = base64.b64encode(audio_data).decode('utf-8')
             audio_event = {
@@ -76,8 +74,6 @@ class AudioProcessor:
             self.logger.error(f"Failed to send input audio: {e}")
 
     async def audio_playback_handler(self):
-        """Handle playback of translated audio with initial buffering."""
-        # Wait for initial buffer to accumulate
         self.logger.info(f"Waiting until we have at least {self.initial_buffer_size} segments buffered before starting playback.")
         while self.client.running:
             if self.translated_audio_queue.qsize() >= self.initial_buffer_size:
@@ -87,46 +83,33 @@ class AudioProcessor:
             else:
                 await asyncio.sleep(0.1)
 
-        # Now continuously play back and write to output pipe
         while self.client.running:
             try:
                 audio_data = await self.translated_audio_queue.get()
                 await self.play_audio(audio_data)
                 self.translated_audio_queue.task_done()
-
-                # Write audio data to the seamless output audio pipe
                 await self.write_to_output_audio_pipe(audio_data)
             except Exception as e:
                 self.logger.error(f"Error in audio_playback_handler: {e}")
 
     async def play_audio(self, audio_data: bytes):
-        """Play audio locally and write it to current segment and output WAV file."""
         try:
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            # Local playback (blocking, off the main thread)
             play_obj = sa.play_buffer(audio_array, AUDIO_CHANNELS, AUDIO_SAMPLE_WIDTH, AUDIO_SAMPLE_RATE)
             await asyncio.to_thread(play_obj.wait_done)
 
-            # Write to current audio segment file
             async with self.segment_lock:
                 if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
                     self.client.current_audio_segment_wf.writeframes(audio_data)
-                    self.logger.debug("Written audio data to current audio segment WAV file.")
                 else:
                     self.logger.warning("No current audio segment WAV file to write to.")
 
-            # Write to output WAV
             if self.client.output_wav:
                 self.client.output_wav.writeframes(audio_data)
-                self.logger.debug("Written translated audio chunk to output WAV file.")
-            else:
-                self.logger.warning("Output WAV file is not initialized.")
-
         except Exception as e:
             self.logger.error(f"Error playing or buffering audio: {e}")
 
     async def start_new_audio_segment(self, segment_index: int = None):
-        """Initialize a new audio segment WAV file for the given segment index."""
         async with self.segment_lock:
             try:
                 if segment_index is None:
@@ -144,11 +127,10 @@ class AudioProcessor:
                 self.client.current_audio_segment_wf = None
 
     async def close_current_audio_segment(self, segment_index: int = None):
-        """Close the current audio segment WAV file."""
         async with self.segment_lock:
             try:
                 if segment_index is None:
-                    segment_index = await self.client.get_segment_index() - 1  # Adjust for the previous segment
+                    segment_index = await self.client.get_segment_index() - 1
                 if hasattr(self.client, 'current_audio_segment_wf') and self.client.current_audio_segment_wf:
                     self.client.current_audio_segment_wf.close()
                     self.logger.info(f"Closed audio segment file for segment {segment_index}.")
