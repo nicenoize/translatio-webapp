@@ -10,7 +10,7 @@ import simpleaudio as sa
 import numpy as np
 import logging
 from typing import Optional
-from .utils import format_timestamp_vtt
+from .utils import format_timestamp_srt
 from config import AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_WIDTH
 from collections import deque
 import aiofiles

@@ -51,8 +51,8 @@ class Muxer:
                 self.run_ffmpeg_command(video_path, audio_path, subtitles_path, final_output_path, segment_index, audio_offset)
 
                 # Clean up subtitles if present
-                if os.path.exists(subtitles_path):
-                    os.remove(subtitles_path)
+                # if os.path.exists(subtitles_path):
+                #     os.remove(subtitles_path)
 
                 self.muxing_queue.task_done()
 

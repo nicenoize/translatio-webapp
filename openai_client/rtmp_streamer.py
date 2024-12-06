@@ -24,7 +24,7 @@ class RTMPStreamer:
             client (OpenAIClient): Reference to the OpenAIClient instance.
             logger (logging.Logger): Logger instance.
             audio_input (str): Path to the audio file.
-            subtitles_input (str): Path to the subtitles file (WebVTT).
+            subtitles_input (str): Path to the subtitles file (SRT).
             output_file (str): Path to the output MP4 file to be created.
             buffer_duration (int): Time to wait before processing (simulate buffering).
         """

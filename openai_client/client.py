@@ -32,7 +32,7 @@ from .video_processing import VideoProcessor
 from .muxing import Muxer
 from .rtmp_streamer import RTMPStreamer
 from .dashboard import Dashboard
-from .utils import format_timestamp_vtt
+from .utils import format_timestamp_srt
 
 class OpenAIClient:
     def __init__(self, api_key: str):
@@ -127,7 +127,7 @@ class OpenAIClient:
             client=self,
             logger=self.rtmp_logger,
             audio_input='output/audio/output.wav',
-            subtitles_input='output/subtitles/master_subtitles.vtt',
+            subtitles_input='output/subtitles/master_subtitles.srt',
             output_file='output/final/output_with_subs.mp4',
             buffer_duration=5
         )
@@ -152,18 +152,18 @@ class OpenAIClient:
             assert self.segment_index > old_index, "Segment index did not increment correctly!"
 
     async def initialize_temp_subtitles(self, segment_index: int):
-        """Initialize a temporary WebVTT subtitle file for the given segment."""
-        temp_subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.vtt'
+        """Initialize a temporary SRT subtitle file for the given segment."""
+        temp_subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
         try:
             os.makedirs(os.path.dirname(temp_subtitles_path), exist_ok=True)
             if not os.path.exists(temp_subtitles_path):
                 async with aiofiles.open(temp_subtitles_path, 'w', encoding='utf-8') as f:
-                    await f.write("WEBVTT\n\n")
-                self.logger.info(f"Initialized temporary WebVTT file for segment {segment_index} at {temp_subtitles_path}")
+                    pass
+                self.logger.info(f"Initialized temporary SRT file for segment {segment_index} at {temp_subtitles_path}")
             else:
-                self.logger.info(f"Temporary WebVTT file for segment {segment_index} already exists at {temp_subtitles_path}")
+                self.logger.info(f"Temporary SRT file for segment {segment_index} already exists at {temp_subtitles_path}")
         except Exception as e:
-            self.logger.error(f"Failed to initialize temporary WebVTT file for segment {segment_index}: {e}")
+            self.logger.error(f"Failed to initialize temporary SRT file for segment {segment_index}: {e}")
 
     async def enqueue_muxing_job(self, muxing_job: Dict[str, Any]):
         """Enqueue a muxing job to the Muxer."""
@@ -384,9 +384,9 @@ class OpenAIClient:
             self.logger.info(f"Received text delta: '{delta_text}'")
             self.current_transcript += delta_text
 
-        elif event_type == "input_audio_buffer.speech_stopped":
-            self.logger.info("Speech stopped detected by server.")
-            await self.commit_audio_buffer()
+        # elif event_type == "input_audio_buffer.speech_stopped":
+        #     self.logger.info("Speech stopped detected by server.")
+        #     await self.commit_audio_buffer()
 
         elif event_type == "conversation.item.created":
             item = event.get("item", {})
@@ -427,36 +427,37 @@ class OpenAIClient:
                 # Close the current audio segment
                 await self.audio_processor.close_current_audio_segment(video_segment_index)
 
-                # **New: Adjust the segment duration immediately**
+                # Adjust audio segment duration
                 segment_audio_path = f'output/audio/output_audio_segment_{video_segment_index}.wav'
                 self.fix_audio_segment_duration(segment_audio_path, self.SEGMENT_DURATION)
 
-                # Write the subtitle
-                start_time = video_segment_index * self.SEGMENT_DURATION
-                end_time = (video_segment_index + 1) * self.SEGMENT_DURATION
-                await self.write_vtt_subtitle(current_segment_index, start_time, end_time, transcript)
+                # Write subtitles for the *just completed segment*
+                start_time = 0
+                end_time = self.SEGMENT_DURATION
+                await self.write_srt_subtitle(video_segment_index, start_time, end_time, transcript)
 
-                # Enqueue muxing job without adjusting audio offset at muxing stage
+                # Enqueue the muxing job with the matching video_segment_index
                 muxing_job = {
                     "segment_index": video_segment_index,
                     "video": f'output/video/output_video_segment_{video_segment_index}.mp4',
                     "audio": segment_audio_path,
-                    "subtitles": f'output/subtitles/subtitles_segment_{video_segment_index}.vtt',
+                    "subtitles": f'output/subtitles/subtitles_segment_{video_segment_index}.srt',
                     "output": f'output/final/output_final_segment_{video_segment_index}.mp4',
                     "audio_offset": 0.0
                 }
                 await self.enqueue_muxing_job(muxing_job)
                 self.logger.info(f"Enqueued muxing job for segment {video_segment_index}")
 
-                # Initialize subtitle file for the next segment
+                # Now initialize the subtitle file for the *next* segment (current_segment_index)
                 await self.initialize_temp_subtitles(current_segment_index)
 
-                # Start a new audio segment for the next video segment
+                # Start new audio segment recording for the next segment
                 await self.audio_processor.start_new_audio_segment(current_segment_index)
 
                 # Reset the current transcript
                 self.current_transcript = ""
                 self.logger.debug("Reset current transcript for the next segment.")
+
 
         elif event_type == "rate_limits.updated":
             rate_limits = event.get("rate_limits", [])
@@ -678,23 +679,28 @@ class OpenAIClient:
                 self.logger.error(f"Error reading input audio: {e}")
                 await asyncio.sleep(1)
 
-    async def write_vtt_subtitle(self, segment_index: int, start_time: float, end_time: float, text: str):
-        temp_subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.vtt'
+    async def write_srt_subtitle(self, segment_index: int, start_time: float, end_time: float, text: str):
+        temp_subtitles_path = f'output/subtitles/subtitles_segment_{segment_index}.srt'
         try:
             if not os.path.exists(temp_subtitles_path):
                 async with aiofiles.open(temp_subtitles_path, 'w', encoding='utf-8') as f:
-                    await f.write("WEBVTT\n\n")
+                    pass  # No special header needed for SRT
 
-            start_vtt = format_timestamp_vtt(start_time)
-            end_vtt = format_timestamp_vtt(end_time)
+            start_srt = format_timestamp_srt(start_time)
+            end_srt = format_timestamp_srt(end_time)
 
             subtitle_index = await self.get_next_subtitle_index(segment_index)
-            subtitle = f"{subtitle_index}\n{start_vtt} --> {end_vtt}\n{text}\n\n"
+            # SRT format: 
+            # index
+            # HH:MM:SS,mmm --> HH:MM:SS,mmm
+            # text
+            # (blank line)
+            subtitle = f"{subtitle_index}\n{start_srt} --> {end_srt}\n{text}\n\n"
 
             async with aiofiles.open(temp_subtitles_path, 'a', encoding='utf-8') as f:
                 await f.write(subtitle)
         except Exception as e:
-            self.logger.error(f"Error writing WebVTT subtitle to {temp_subtitles_path}: {e}")
+            self.logger.error(f"Error writing SRT subtitle to {temp_subtitles_path}: {e}")
 
     async def get_next_subtitle_index(self, segment_index: int) -> int:
         if not hasattr(self, 'subtitle_indices'):

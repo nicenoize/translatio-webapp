@@ -11,7 +11,7 @@ AUDIO_CHANNELS = 1         # Mono
 AUDIO_SAMPLE_WIDTH = 2     # 16-bit PCM
 
 # Paths
-SUBTITLE_PATH = 'output/subtitles/subtitles.vtt'
+SUBTITLE_PATH = 'output/subtitles/subtitles.srt'
 OUTPUT_WAV_PATH = 'output/audio/output_audio.wav'
 STREAM_URL = 'https://bintu-play.nanocosmos.de/h5live/http/stream.mp4?url=rtmp://localhost/play&stream=sNVi5-kYN1t'
 PLAYOUT_URL = 'rtmp://bintu-vtrans.nanocosmos.de/live/sNVi5-egEGF'
