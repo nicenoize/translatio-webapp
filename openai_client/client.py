@@ -595,15 +595,17 @@ class OpenAIClient:
         async with self.response_lock:
             latest_audio_segment = f'output/audio/output_audio_segment_{self.segment_index - 1}.wav'
 
-            gender = self.predict_gender(latest_audio_segment)
-            if gender == 'male':
-                selected_voice = self.MALE_VOICE_ID
-            elif gender == 'female':
-                selected_voice = self.FEMALE_VOICE_ID
-            else:
-                selected_voice = self.DEFAULT_VOICE_ID
+            # gender = self.predict_gender(latest_audio_segment)
+            # if gender == 'male':
+            #     selected_voice = self.MALE_VOICE_ID
+            # elif gender == 'female':
+            #     selected_voice = self.FEMALE_VOICE_ID
+            # else:
+            #     selected_voice = self.DEFAULT_VOICE_ID
 
-            self.logger.info(f"Detected gender: '{gender}'. Selected voice ID: '{selected_voice}'")
+            # self.logger.info(f"Detected gender: '{gender}'. Selected voice ID: '{selected_voice}'")
+
+            selected_voice = self.DEFAULT_VOICE_ID
 
             response_event = {
                 "type": "response.create",

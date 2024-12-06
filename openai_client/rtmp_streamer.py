@@ -14,6 +14,9 @@ class RTMPStreamer:
         buffer_duration: int = 5,
         max_retries: int = 3,
         retry_delay: int = 2,
+        min_buffer_duration: int = 2,
+        max_buffer_duration: int = 20,
+        adjustment_interval: int = 10,
     ):
         """
         Stream video segments to an RTMP server.
@@ -21,10 +24,12 @@ class RTMPStreamer:
         Args:
             logger (logging.Logger): Logger instance.
             segments_dir (str): Directory where video segments are stored.
-            rtmp_url (str): RTMP server URL to stream to.
-            buffer_duration (int): Time to wait before processing new segments.
+            buffer_duration (int): Initial buffer duration in seconds.
             max_retries (int): Maximum retries for failed FFmpeg commands.
             retry_delay (int): Delay between retries for failed FFmpeg commands.
+            min_buffer_duration (int): Minimum allowed buffer duration.
+            max_buffer_duration (int): Maximum allowed buffer duration.
+            adjustment_interval (int): Time interval in seconds for buffer adjustment checks.
         """
         self.logger = logger
         self.segments_dir = segments_dir
@@ -32,28 +37,32 @@ class RTMPStreamer:
         self.buffer_duration = buffer_duration
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.min_buffer_duration = min_buffer_duration
+        self.max_buffer_duration = max_buffer_duration
+        self.adjustment_interval = adjustment_interval
         self.running = True
         self.processed_segments = set()
+        self.unavailable_count = 0
+        self.adjust_count = 0
 
     async def stream_segments(self):
         """Stream video segments to an RTMP server."""
         try:
             self.logger.info("Starting RTMP streaming process.")
-
             while self.running:
-                # Get list of unprocessed segments
                 all_segments = sorted(
                     [os.path.join(self.segments_dir, f) for f in os.listdir(self.segments_dir)
                      if f.startswith("output_final_segment") and f not in self.processed_segments]
                 )
 
                 if not all_segments:
-                    self.logger.info("No new segments found. Waiting for next segment...")
+                    self.logger.warning("No new segments found. Increasing buffer duration.")
+                    self.unavailable_count += 1
+                    await self.adjust_buffer_duration()
                     await asyncio.sleep(self.buffer_duration)
                     continue
 
                 self.logger.info(f"Found {len(all_segments)} new segment(s) to process.")
-
                 for segment in all_segments:
                     if not self.running:
                         self.logger.info("RTMP streaming process was stopped.")
@@ -65,8 +74,7 @@ class RTMPStreamer:
                     # Mark the segment as processed
                     self.processed_segments.add(os.path.basename(segment))
 
-                # Wait briefly before checking for new segments
-                self.logger.debug(f"Buffering for {self.buffer_duration} seconds before checking for new segments...")
+                self.unavailable_count = 0  # Reset on successful processing
                 await asyncio.sleep(self.buffer_duration)
 
         except Exception as e:
@@ -90,7 +98,6 @@ class RTMPStreamer:
                 return
             else:
                 self.logger.error(f"FFmpeg failed with exit code {process.returncode} for segment {segment}.")
-                self.logger.error(f"FFmpeg stderr: {stderr.decode('utf-8', errors='replace')}")
                 retries += 1
                 if retries <= self.max_retries:
                     self.logger.warning(f"Retrying... ({retries}/{self.max_retries})")
@@ -119,6 +126,19 @@ class RTMPStreamer:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
+
+    async def adjust_buffer_duration(self):
+        """Dynamically adjust the buffer duration based on streaming conditions."""
+        self.adjust_count += 1
+        if self.unavailable_count > 3:
+            # Increase buffer duration if segments are frequently unavailable
+            self.buffer_duration = min(self.buffer_duration + 2, self.max_buffer_duration)
+            self.logger.info(f"Increasing buffer duration to {self.buffer_duration}s.")
+        elif self.adjust_count >= self.adjustment_interval:
+            # Decrease buffer duration if segments are consistently available
+            self.buffer_duration = max(self.buffer_duration - 1, self.min_buffer_duration)
+            self.logger.info(f"Decreasing buffer duration to {self.buffer_duration}s.")
+            self.adjust_count = 0
 
     def start(self):
         """Start the RTMP streaming process."""
