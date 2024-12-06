@@ -158,7 +158,6 @@ class OpenAIClient:
         'output/audio/',
         'output/subtitles',
         'output/logs',
-        'output/video/'
     ]
 
     clear_directories(directories_to_clear)

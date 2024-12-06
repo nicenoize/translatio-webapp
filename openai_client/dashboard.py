@@ -38,15 +38,74 @@ class Dashboard:
         <head>
             <title>Real-Time Translator Dashboard</title>
             <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                h1 {{ color: #333; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ border: 1px solid #ddd; padding: 8px; }}
-                th {{ background-color: #f2f2f2; }}
-                .chart-container {{
+                body {{
+                    font-family: 'Arial', sans-serif;
+                    background-color: #121212;
+                    color: #e0e0e0;
+                    margin: 0;
+                    padding: 0;
+                }}
+                h1, h2 {{
+                    color: #EC7D0D;
+                    text-align: center;
+                }}
+                .dashboard-container {{
+                    padding: 20px;
+                }}
+                table {{
                     width: 100%;
-                    height: 400px;
+                    border-collapse: collapse;
+                    margin: 20px 0;
+                }}
+                th, td {{
+                    padding: 12px;
+                    text-align: left;
+                    border: 1px solid #444;
+                    color: #e0e0e0;
+                }}
+                th {{
+                    background-color: #222;
+                }}
+                td {{
+                    background-color: #1e1e1e;
+                }}
+                .chart-container {{
+                    background-color: #1e1e1e;
+                    border: 1px solid #444;
+                    border-radius: 8px;
+                    padding: 20px;
                     margin-top: 20px;
+                    /* Increased width and height */
+                    width: 90%; /* Increased from 80% to 90% */
+                    max-width: 1200px; /* Increased from 1000px to 1200px */
+                    height: 600px; /* Set a specific height */
+                    margin-left: auto;
+                    margin-right: auto;
+                }}
+                canvas {{
+                    display: block;
+                    margin: 0 auto;
+                    width: 100% !important; /* Ensure the canvas takes full width of the container */
+                    height: 100% !important; /* Ensure the canvas takes full height of the container */
+                }}
+                .metric-value {{
+                    font-weight: bold;
+                    color: #f1c40f;
+                }}
+                .button {{
+                    display: inline-block;
+                    padding: 10px 20px;
+                    font-size: 16px;
+                    color: #fff;
+                    background-color: #f39c12;
+                    border: none;
+                    border-radius: 5px;
+                    text-decoration: none;
+                    text-align: center;
+                    cursor: pointer;
+                }}
+                .button:hover {{
+                    background-color: #e67e22;
                 }}
             </style>
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -84,25 +143,52 @@ class Dashboard:
                             datasets: [{{
                                 label: 'Processing Delay (s)',
                                 data: [],
-                                borderColor: 'rgba(75, 192, 192, 1)',
-                                backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                                borderColor: '#EC7D0D', /* Changed from blue to orange */
+                                backgroundColor: 'rgba(236, 125, 13, 0.2)', /* Changed to semi-transparent orange */
+                                pointBackgroundColor: '#EC7D0D', /* Optional: Set point color to orange */
+                                pointBorderColor: '#EC7D0D', /* Optional: Set point border to orange */
+                                pointHoverBackgroundColor: '#fff', /* Optional: Hover effect */
+                                pointHoverBorderColor: '#EC7D0D', /* Optional: Hover effect */
                                 fill: true,
                                 tension: 0.1
                             }}]
                         }},
                         options: {{
+                            responsive: true,
+                            maintainAspectRatio: false, /* Allow the chart to adjust to the container size */
                             scales: {{
                                 x: {{
                                     title: {{
                                         display: true,
-                                        text: 'Sample'
+                                        text: 'Sample',
+                                        color: '#EC7D0D' /* Optional: Title color */
+                                    }},
+                                    ticks: {{
+                                        color: '#EC7D0D' /* Set X-axis tick color to orange */
+                                    }},
+                                    grid: {{
+                                        color: 'rgba(236, 125, 13, 0.1)' /* Optional: Grid lines color */
                                     }}
                                 }},
                                 y: {{
                                     beginAtZero: true,
                                     title: {{
                                         display: true,
-                                        text: 'Delay (s)'
+                                        text: 'Delay (s)',
+                                        color: '#EC7D0D' /* Optional: Title color */
+                                    }},
+                                    ticks: {{
+                                        color: '#EC7D0D' /* Set Y-axis tick color to orange */
+                                    }},
+                                    grid: {{
+                                        color: 'rgba(236, 125, 13, 0.1)' /* Optional: Grid lines color */
+                                    }}
+                                }}
+                            }},
+                            plugins: {{
+                                legend: {{
+                                    labels: {{
+                                        color: '#EC7D0D' /* Set legend text color to orange */
                                     }}
                                 }}
                             }}
@@ -139,6 +225,8 @@ class Dashboard:
         </html>
         """
         return web.Response(text=html, content_type='text/html')
+
+
 
     async def metrics_endpoint(self, request):
         """Provide metrics in JSON format for the dashboard."""
