@@ -1,9 +1,9 @@
-# dashboard.py
+# openai_client/dashboard.py
 
 from aiohttp import web
 import asyncio
 import logging
-import time  # Added import for time module
+import time 
 
 
 class Dashboard:

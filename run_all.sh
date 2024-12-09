@@ -12,7 +12,7 @@ if lsof -i :8000 -t >/dev/null; then
 fi
 
 # Define absolute paths based on your project directory
-PROJECT_DIR="/Users/seebo/Documents/Uni/Masterarbeit/repo/translatio-webapp"
+PROJECT_DIR="./"
 
 # Define named pipes with absolute paths
 INPUT_AUDIO_PIPE="$PROJECT_DIR/input_audio_pipe"

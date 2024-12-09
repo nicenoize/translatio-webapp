@@ -1,17 +1,16 @@
-# rtmp_streamer.py
+# openai_client/rtmp_streamer.py
 
 import asyncio
 import logging
 import os
 import subprocess
-from typing import Optional
 
 from config import RTMP_PLAYOUT_URL
 
 class RTMPStreamer:
     def __init__(
         self,
-        client,  # Reference to OpenAIClient for metrics updates
+        client, 
         logger: logging.Logger,
         segments_dir: str = 'segments',
         buffer_duration: int = 5,
@@ -111,7 +110,7 @@ class RTMPStreamer:
         """
         retries = 0
         while retries <= self.max_retries:
-            process = await self._run_ffmpeg(segment)
+            process = await self.run_ffmpeg(segment)
             stdout, stderr = await process.communicate()
 
             # Log FFmpeg output
@@ -133,7 +132,7 @@ class RTMPStreamer:
         self.logger.error(f"Failed to stream segment {segment} after {self.max_retries} retries.")
         return False
 
-    async def _run_ffmpeg(self, segment: str) -> asyncio.subprocess.Process:
+    async def run_ffmpeg(self, segment: str) -> asyncio.subprocess.Process:
         """Run FFmpeg to stream a segment.
 
         Args:

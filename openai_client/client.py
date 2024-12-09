@@ -399,6 +399,7 @@ class OpenAIClient:
         if event_type == "input_audio_buffer.speech_started":
             self.logger.info("Speech started detected by server.")
 
+        # Commit is not needed, if vad is acttivated, trying to avoid duplicate input
         # elif event_type == "input_audio_buffer.speech_stopped":
         #     self.logger.info("Speech stopped detected by server.")
         #     await self.commit_audio_buffer()
@@ -409,6 +410,7 @@ class OpenAIClient:
                 self.logger.info("Function call detected.")
                 await self.handle_function_call(item)
 
+        # deactivated to avoid duplicates - not sure whether it's better to concatenate delta or just use the .done message
         # elif event_type == "response.text.delta":
         #     delta_text = event.get("delta", "")
         #     self.logger.info(f"Received text delta: '{delta_text}'")
@@ -616,6 +618,8 @@ class OpenAIClient:
     async def create_response(self):
         async with self.response_lock:
             latest_audio_segment = f'output/audio/output_audio_segment_{self.segment_index - 1}.wav'
+
+            # This is deactivated for now
 
             # gender = self.predict_gender(latest_audio_segment)
             # if gender == 'male':
